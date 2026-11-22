@@ -2,6 +2,7 @@ import argparse
 import os
 import signal
 import sys
+import tempfile
 from pathlib import Path
 from threading import current_thread, main_thread
 
@@ -56,11 +57,12 @@ def _run_console_command(
         signal.signal(signal.SIGINT, previous_handler)
 
 
-def _create_brain(memory: MemoryStore, data_dir: Path) -> ClaudeBrain | None:
+def _create_brain(memory: MemoryStore) -> ClaudeBrain | None:
     executable = find_claude_executable()
     if executable is None:
         return None
-    return ClaudeBrain([executable], memory, data_dir / "cerebro")
+    # Carpeta vacía en Temp: Claude Code no encuentra ahí CLAUDE.md ni ajustes de proyectos.
+    return ClaudeBrain([executable], memory, Path(tempfile.gettempdir()) / "jarvis-cerebro")
 
 
 def main(argv: list[str] | None = None, *, audit_path: Path | None = None) -> int:
@@ -87,7 +89,7 @@ def main(argv: list[str] | None = None, *, audit_path: Path | None = None) -> in
         print("No se pudo inicializar el acceso a las herramientas de Windows.")
         return 1
 
-    brain = None if args.sin_ia else _create_brain(memory, audit_path.parent)
+    brain = None if args.sin_ia else _create_brain(memory)
     try:
         return _run_mode(args, tools, audit, brain)
     finally:

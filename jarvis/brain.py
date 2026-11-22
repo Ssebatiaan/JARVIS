@@ -22,6 +22,8 @@ IDLE_SECONDS = 600
 MAX_TURNS = 30
 RESPONSE_TIMEOUT = 15.0
 HISTORY_IN_PROMPT = 10
+# La línea de comandos de Windows admite 32 767 caracteres; se deja margen para el resto.
+MAX_PROMPT_CHARS = 24_000
 NOTE_LIMIT = 300
 
 TOOL_CATALOG = (
@@ -168,6 +170,7 @@ class ClaudeBrain:
     # --- ciclo de vida -------------------------------------------------------------------
 
     def _system_prompt(self) -> str:
+        """Prompt con herramientas, recuerdos e historial, recortado para caber en la línea de comandos."""
         catalog = "\n".join(f"- {tool}: argumentos {args}. {text}." for tool, args, text in TOOL_CATALOG)
         parts = [BASE_PROMPT.replace("{catalog}", catalog)]
         facts = self._memory.facts()
@@ -176,17 +179,21 @@ class ClaudeBrain:
             parts.extend(f"{fact.id}. {fact.text}" for fact in facts)
         else:
             parts.append("Todavía no recuerdas nada del usuario.")
+        base = "\n".join(parts)
         history = self._memory.recent_exchanges(HISTORY_IN_PROMPT)
-        if history:
-            parts.append("\nConversación reciente (de sesiones anteriores):")
-            for exchange in history:
-                parts.append(f"Usuario: {exchange.user_text}\nJARVIS: {exchange.reply}")
-        return "\n".join(parts)
+        while history:
+            lines = ["\nConversación reciente (de sesiones anteriores):"]
+            lines.extend(f"Usuario: {item.user_text}\nJARVIS: {item.reply}" for item in history)
+            prompt = base + "\n" + "\n".join(lines)
+            if len(prompt) <= MAX_PROMPT_CHARS:
+                return prompt
+            history = history[1:]
+        return base[:MAX_PROMPT_CHARS]
 
     def _start(self) -> _Session:
+        # El prompt va como argumento y no como archivo: el Python de Microsoft Store redirige
+        # en silencio lo que escribe en AppData, y Claude Code no vería ese archivo.
         self._workdir.mkdir(parents=True, exist_ok=True)
-        prompt_file = self._workdir / "sistema.txt"
-        prompt_file.write_text(self._system_prompt(), encoding="utf-8")
         arguments = [
             *self._command, "-p",
             "--input-format", "stream-json",
@@ -196,7 +203,7 @@ class ClaudeBrain:
             "--strict-mcp-config",
             "--no-session-persistence",
             "--setting-sources", "",
-            "--system-prompt-file", str(prompt_file),
+            "--system-prompt", self._system_prompt(),
         ]
         environment = {
             **os.environ,
@@ -255,10 +262,6 @@ class ClaudeBrain:
             session.reader.join(timeout=2)
         if process.stdout and (session.reader is None or not session.reader.is_alive()):
             process.stdout.close()
-        try:
-            (self._workdir / "sistema.txt").unlink(missing_ok=True)
-        except OSError:
-            pass
 
     def _schedule_idle_close(self) -> None:
         if self._idle_timer is not None:

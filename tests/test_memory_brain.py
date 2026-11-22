@@ -20,7 +20,7 @@ import json, os, sys, time
 sys.stdin.reconfigure(encoding="utf-8")
 sys.stdout.reconfigure(encoding="utf-8")
 args = sys.argv[1:]
-system = open(args[args.index("--system-prompt-file") + 1], encoding="utf-8").read()
+system = args[args.index("--system-prompt") + 1]
 print(json.dumps({"type": "system", "subtype": "init"}), flush=True)
 for line in sys.stdin:
     content = json.loads(line)["message"]["content"]
@@ -302,8 +302,17 @@ class ClaudeBrainProcessTests(unittest.TestCase):
         self.assertIn("1. Se llama Ana", first["system"])
         self.assertIn("Usuario: hola\nJARVIS: Hola, Ana", first["system"])
         self.assertEqual(second["content"], "¿qué tal?")
-        brain.close()
-        self.assertFalse((self.workdir / "sistema.txt").exists())
+
+    def test_system_prompt_drops_old_history_to_fit_the_command_line(self):
+        for index in range(20):
+            self.memory.add_exchange(f"pregunta {index} " + "x" * 450, "respuesta " + "y" * 450)
+        for index in range(50):
+            self.memory.add_fact(f"dato {index} " + "z" * 280)
+        prompt = self.brain()._system_prompt()
+        self.assertLessEqual(len(prompt), 24_000)
+        self.assertIn("50. dato 49", prompt)
+        self.assertIn("pregunta 19", prompt)
+        self.assertNotIn("pregunta 10 ", prompt)
 
     def test_direct_results_and_memory_changes_reach_the_next_request(self):
         brain = self.brain()
