@@ -7,12 +7,12 @@ libera tras unos minutos sin uso para no ocupar RAM.
 
 import asyncio
 import gc
-import io
+import queue
 import re
 import subprocess
 import threading
 from collections.abc import Callable, Iterable, Iterator
-from time import sleep
+from time import monotonic, sleep
 
 SAMPLE_RATE = 16_000
 BLOCK_SECONDS = 0.1
@@ -207,46 +207,235 @@ class SpeechRecognizer:
 
 # --- hablar --------------------------------------------------------------------------------
 
-def _neural_speech(text: str) -> tuple:
-    """Audio de la voz Jorge en float32 mono a 24 kHz."""
-    import av
-    import edge_tts
-    import numpy as np
-
-    async def collect() -> bytes:
-        data = bytearray()
-        communicate = edge_tts.Communicate(text, VOICE, rate=VOICE_RATE, pitch=VOICE_PITCH)
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                data.extend(chunk["data"])
-        return bytes(data)
-
-    mp3 = asyncio.run(collect())
-    if not mp3:
-        raise VoiceUnavailable("El servicio de voz no devolvió audio.")
-    container = av.open(io.BytesIO(mp3), format="mp3")
-    resampler = av.AudioResampler(format="flt", layout="mono", rate=24_000)
-    chunks = []
-    for frame in container.decode(audio=0):
-        for out in resampler.resample(frame):
-            chunks.append(out.to_ndarray().reshape(-1))
-    container.close()
-    return np.concatenate(chunks), 24_000
+OUTPUT_RATE = 24_000
+# El servicio cierra las conexiones inactivas entre 30 y 90 s (medido): se renuevan antes.
+CONNECTION_REUSE_SECONDS = 45
+CHUNK_TIMEOUT = 8.0
 
 
-def _play(audio, rate: int, stop: threading.Event) -> None:
+class _Mp3Decoder:
+    """Decodifica MP3 por partes, a medida que llega, en float32 mono a 24 kHz."""
+
+    def __init__(self):
+        import av
+
+        self._codec = av.CodecContext.create("mp3", "r")
+        self._resampler = av.AudioResampler(format="flt", layout="mono", rate=OUTPUT_RATE)
+
+    def _frames(self, frames) -> list:
+        return [chunk.to_ndarray().reshape(-1).copy() for frame in frames
+                for chunk in self._resampler.resample(frame)]
+
+    def feed(self, data: bytes) -> list:
+        return [chunk for packet in self._codec.parse(data) for chunk in self._frames(self._codec.decode(packet))]
+
+    def flush(self) -> list:
+        chunks = [chunk for packet in self._codec.parse(b"") for chunk in self._frames(self._codec.decode(packet))]
+        return chunks + self._frames(self._codec.decode(None))
+
+
+class NeuralStream:
+    """Voz Jorge por una conexión persistente al servicio de voz de Edge.
+
+    Abrir la conexión cuesta ~0,8 s; con ella abierta el audio empieza en ~0,2-0,5 s (medido).
+    warm() la abre por adelantado mientras JARVIS escucha o trabaja. Usa piezas internas de
+    edge-tts 7.3.1, la versión fijada en requirements.txt; si cambian, se usa el método simple.
+    """
+
+    def __init__(self):
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._start_lock = threading.Lock()
+        self._session = None
+        self._socket = None
+        self._last_used = 0.0
+        self._connect_lock: asyncio.Lock | None = None
+        self._speech_lock: asyncio.Lock | None = None
+
+    def _submit(self, coroutine):
+        with self._start_lock:
+            if self._loop is None:
+                self._loop = asyncio.new_event_loop()
+                threading.Thread(target=self._loop.run_forever, name="jarvis-voz-red", daemon=True).start()
+        return asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+
+    def warm(self) -> None:
+        self._submit(self._warm())
+
+    async def _warm(self) -> None:
+        try:
+            await self._connection()
+        except Exception:
+            pass  # se reintentará al hablar
+
+    def _fresh(self) -> bool:
+        socket = self._socket
+        return (socket is not None and not socket.closed
+                and monotonic() - self._last_used < CONNECTION_REUSE_SECONDS)
+
+    async def _connection(self):
+        import aiohttp
+        from edge_tts import communicate as protocol
+        from edge_tts.constants import SEC_MS_GEC_VERSION, WSS_HEADERS, WSS_URL
+        from edge_tts.drm import DRM
+
+        if self._connect_lock is None:
+            self._connect_lock = asyncio.Lock()
+        async with self._connect_lock:
+            if self._fresh():
+                return self._socket
+            await self._disconnect()
+            if self._session is None or self._session.closed:
+                self._session = aiohttp.ClientSession(trust_env=True)
+            url = (f"{WSS_URL}&ConnectionId={protocol.connect_id()}"
+                   f"&Sec-MS-GEC={DRM.generate_sec_ms_gec()}&Sec-MS-GEC-Version={SEC_MS_GEC_VERSION}")
+            try:
+                socket = await self._session.ws_connect(
+                    url, compress=15, headers=DRM.headers_with_muid(WSS_HEADERS), ssl=protocol._SSL_CTX,
+                )
+            except aiohttp.ClientResponseError as error:
+                if error.status == 403:
+                    DRM.handle_client_response_error(error)  # corrige el desfase del reloj
+                raise
+            await socket.send_str(
+                f"X-Timestamp:{protocol.date_to_string()}\r\n"
+                "Content-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n"
+                '{"context":{"synthesis":{"audio":{"metadataoptions":{'
+                '"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"false"},'
+                '"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}\r\n'
+            )
+            self._socket, self._last_used = socket, monotonic()
+            return socket
+
+    async def _disconnect(self) -> None:
+        socket, self._socket = self._socket, None
+        if socket is not None and not socket.closed:
+            try:
+                await socket.close()
+            except Exception:
+                pass
+
+    async def _produce(self, text: str, out: queue.Queue, stop: threading.Event) -> None:
+        import aiohttp
+        from edge_tts import communicate as protocol
+        from edge_tts.data_classes import TTSConfig
+
+        if self._speech_lock is None:
+            self._speech_lock = asyncio.Lock()
+        produced = False
+        try:
+            async with self._speech_lock:
+                for attempt in (1, 2):
+                    try:
+                        socket = await self._connection()
+                        self._last_used = monotonic()
+                        config = TTSConfig(VOICE, VOICE_RATE, "+0%", VOICE_PITCH, "SentenceBoundary")
+                        await socket.send_str(protocol.ssml_headers_plus_data(
+                            protocol.connect_id(), protocol.date_to_string(),
+                            protocol.mkssml(config, protocol.escape(text)),
+                        ))
+                        decoder = _Mp3Decoder()
+                        finished = False
+                        async for message in socket:
+                            if stop.is_set():
+                                await self._disconnect()  # corta el audio pendiente
+                                return
+                            if message.type == aiohttp.WSMsgType.BINARY:
+                                header = int.from_bytes(message.data[:2], "big")
+                                for chunk in decoder.feed(message.data[2 + header:]):
+                                    produced = True
+                                    out.put(chunk)
+                            elif message.type == aiohttp.WSMsgType.TEXT:
+                                if "Path:turn.end" in message.data:
+                                    finished = True
+                                    break
+                            else:
+                                break
+                        if not finished:
+                            raise ConnectionResetError("El servicio de voz cerró la conexión.")
+                        for chunk in decoder.flush():
+                            out.put(chunk)
+                        self._last_used = monotonic()
+                        return
+                    except (aiohttp.ClientError, ConnectionError, asyncio.TimeoutError) as error:
+                        await self._disconnect()
+                        if produced or attempt == 2:
+                            raise VoiceUnavailable("El servicio de voz no respondió.") from error
+        except Exception as error:
+            out.put(error)
+        finally:
+            out.put(None)
+
+    def chunks(self, text: str, stop: threading.Event) -> Iterator:
+        out: queue.Queue = queue.Queue()
+        self._submit(self._produce(text, out, stop))
+        while True:
+            try:
+                item = out.get(timeout=CHUNK_TIMEOUT)
+            except queue.Empty:
+                raise VoiceUnavailable("El servicio de voz tardó demasiado.") from None
+            if item is None:
+                return
+            if isinstance(item, Exception):
+                raise item
+            yield item
+
+    def close(self) -> None:
+        if self._loop is None:
+            return
+
+        async def shutdown() -> None:
+            await self._disconnect()
+            if self._session is not None and not self._session.closed:
+                await self._session.close()
+
+        try:
+            self._submit(shutdown()).result(timeout=3)
+        except Exception:
+            pass
+        self._loop.call_soon_threadsafe(self._loop.stop)
+
+
+class OneShotNeural:
+    """Método simple de edge-tts (una conexión por frase). Respaldo si falla el persistente."""
+
+    def chunks(self, text: str, stop: threading.Event) -> Iterator:
+        import edge_tts
+
+        async def collect() -> bytes:
+            data = bytearray()
+            async for chunk in edge_tts.Communicate(text, VOICE, rate=VOICE_RATE, pitch=VOICE_PITCH).stream():
+                if chunk["type"] == "audio":
+                    data.extend(chunk["data"])
+            return bytes(data)
+
+        mp3 = asyncio.run(collect())
+        if not mp3:
+            raise VoiceUnavailable("El servicio de voz no devolvió audio.")
+        decoder = _Mp3Decoder()
+        yield from decoder.feed(mp3)
+        yield from decoder.flush()
+
+
+def _play_chunks(chunks: Iterable, stop: threading.Event) -> None:
+    """Reproduce el audio a medida que llega; abre la salida con el primer bloque."""
     import sounddevice as sd
 
-    sd.play(audio, rate)
+    stream = None
     try:
-        while sd.get_stream().active:
+        for chunk in chunks:
             if stop.is_set():
-                sd.stop()
-                return
-            sleep(0.05)
+                break
+            if stream is None:
+                stream = sd.OutputStream(samplerate=OUTPUT_RATE, channels=1, dtype="float32", latency="low")
+                stream.start()
+            stream.write(chunk.reshape(-1, 1))
     finally:
-        if stop.is_set():
-            sd.stop()
+        if stream is not None:
+            if stop.is_set():
+                stream.abort()
+            else:
+                stream.stop()  # espera a que termine de sonar lo pendiente
+            stream.close()
 
 
 _WINDOWS_SPEECH = (
@@ -256,7 +445,7 @@ _WINDOWS_SPEECH = (
 
 
 def _windows_speech(text: str, stop: threading.Event) -> None:
-    """Respaldo sin internet: la voz instalada en Windows."""
+    """Último respaldo, sin internet: la voz instalada en Windows."""
     process = subprocess.Popen(
         ["powershell", "-NoProfile", "-Command", _WINDOWS_SPEECH], stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
@@ -276,24 +465,44 @@ def _windows_speech(text: str, stop: threading.Event) -> None:
 
 
 class SpeechSynthesizer:
-    def __init__(self, *, synthesize: Callable | None = None, play: Callable | None = None,
+    """Prueba las fuentes de voz en orden y pasa a la siguiente solo si no sonó nada."""
+
+    def __init__(self, *, sources: list | None = None, play: Callable | None = None,
                  fallback: Callable | None = None):
-        self._synthesize = synthesize or _neural_speech
-        self._play = play or _play
+        self._sources = sources if sources is not None else [NeuralStream(), OneShotNeural()]
+        self._play = play or _play_chunks
         self._fallback = fallback or _windows_speech
+
+    def warm(self) -> None:
+        if self._sources and hasattr(self._sources[0], "warm"):
+            self._sources[0].warm()
+
+    def close(self) -> None:
+        for source in self._sources:
+            if hasattr(source, "close"):
+                source.close()
 
     def speak(self, text: str, stop: threading.Event) -> None:
         text = speakable(text)
         if not text or stop.is_set():
             return
-        try:
-            audio, rate = self._synthesize(text)
-        except Exception:
-            if not stop.is_set():
-                self._fallback(text, stop)
-            return
+        for source in self._sources:
+            started = False
+
+            def tracked(source=source):
+                nonlocal started
+                for chunk in source.chunks(text, stop):
+                    started = True
+                    yield chunk
+
+            try:
+                self._play(tracked(), stop)
+                return
+            except Exception:
+                if started or stop.is_set():
+                    return
         if not stop.is_set():
-            self._play(audio, rate, stop)
+            self._fallback(text, stop)
 
 
 class Voice:
@@ -315,6 +524,13 @@ class Voice:
 
     def preload(self) -> None:
         threading.Thread(target=self._safe_preload, daemon=True).start()
+
+    def warm(self) -> None:
+        """Abre por adelantado la conexión de la voz para que la respuesta suene antes."""
+        try:
+            self.synthesizer.warm()
+        except Exception:
+            pass
 
     def _safe_preload(self) -> None:
         try:
@@ -359,6 +575,8 @@ class Voice:
     def close(self) -> None:
         self.stop_speaking()
         self.recognizer.unload()
+        if hasattr(self.synthesizer, "close"):
+            self.synthesizer.close()
 
 
 def create_voice() -> Voice | None:

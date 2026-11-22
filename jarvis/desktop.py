@@ -458,6 +458,7 @@ class DesktopWindow:
         self.root.lift()
         self._fit()
         self._focus()
+        self._warm_voice()
         if self.brain is not None and hasattr(self.brain, "warm_up"):
             Thread(target=_warm_up, args=(self.brain,), daemon=True).start()
 
@@ -537,6 +538,11 @@ class DesktopWindow:
 
     # --- voz ----------------------------------------------------------------------------
 
+    def _warm_voice(self) -> None:
+        """Abre la conexión de la voz mientras JARVIS escucha o trabaja (ahorra ~0,8 s)."""
+        if self.speak_enabled and self.voice is not None and hasattr(self.voice, "warm"):
+            self.voice.warm()
+
     def _refresh_speaker(self) -> None:
         self.speaker_button.configure(
             text=ICON_VOLUME if self.speak_enabled else ICON_MUTE,
@@ -578,6 +584,7 @@ class DesktopWindow:
         listen = _Listen()
         self._listen = listen
         self.voice.stop_speaking()
+        self._warm_voice()
         self.command.set("")
         self._set_output("")
         self.entry.configure(state="disabled")
@@ -635,6 +642,7 @@ class DesktopWindow:
             return
         if self.voice is not None:
             self.voice.stop_speaking()
+            self._warm_voice()
         if not self._history or self._history[-1] != text:
             self._history.append(text)
         self._history_index = len(self._history)

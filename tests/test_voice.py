@@ -99,25 +99,69 @@ class RecognizerTests(unittest.TestCase):
         recognizer.unload()
 
 
+class FakeSource:
+    def __init__(self, chunks=(), error=None):
+        self.chunks_to_send = list(chunks)
+        self.error = error
+        self.asked = []
+        self.warmed = 0
+
+    def chunks(self, text, stop):
+        self.asked.append(text)
+        yield from self.chunks_to_send
+        if self.error:
+            raise self.error
+
+    def warm(self):
+        self.warmed += 1
+
+
+def collect(chunks, stop):
+    collect.played.extend(chunks)
+
+
 class SynthesizerTests(unittest.TestCase):
-    def test_plays_neural_voice_and_falls_back_to_windows_without_internet(self):
-        play, fallback = Mock(), Mock()
-        SpeechSynthesizer(synthesize=lambda text: ("audio", 24000), play=play, fallback=fallback).speak(
-            "Volumen 40 %.", threading.Event())
-        play.assert_called_once()
-        fallback.assert_not_called()
-        failing = Mock(side_effect=OSError("sin red"))
-        SpeechSynthesizer(synthesize=failing, play=play, fallback=fallback).speak("Hola", threading.Event())
-        fallback.assert_called_once()
-        self.assertEqual(fallback.call_args.args[0], "Hola")
+    def setUp(self):
+        collect.played = []
+
+    def synthesizer(self, *sources, fallback=None):
+        self.fallback = fallback or Mock()
+        return SpeechSynthesizer(sources=list(sources), play=collect, fallback=self.fallback)
+
+    def test_streams_the_first_source_and_warms_its_connection(self):
+        first, second = FakeSource(["a", "b"]), FakeSource(["z"])
+        synthesizer = self.synthesizer(first, second)
+        synthesizer.warm()
+        synthesizer.speak("Volumen 40 %.", threading.Event())
+        self.assertEqual(collect.played, ["a", "b"])
+        self.assertEqual(first.asked, ["Volumen 40 por ciento."])
+        self.assertEqual((first.warmed, second.asked), (1, []))
+        self.fallback.assert_not_called()
+
+    def test_falls_back_to_next_source_and_then_to_windows_voice(self):
+        broken = FakeSource(error=OSError("sin red"))
+        backup = FakeSource(["x"])
+        self.synthesizer(broken, backup).speak("Hola", threading.Event())
+        self.assertEqual(collect.played, ["x"])
+        self.fallback.assert_not_called()
+        self.synthesizer(FakeSource(error=OSError()), FakeSource(error=OSError())).speak("Hola", threading.Event())
+        self.fallback.assert_called_once()
+        self.assertEqual(self.fallback.call_args.args[0], "Hola")
+
+    def test_failure_after_audio_started_does_not_repeat_the_answer(self):
+        failing = FakeSource(["a"], error=ConnectionResetError())
+        backup = FakeSource(["otra vez"])
+        self.synthesizer(failing, backup).speak("Hola", threading.Event())
+        self.assertEqual(collect.played, ["a"])
+        self.assertEqual(backup.asked, [])
+        self.fallback.assert_not_called()
 
     def test_stopped_speech_is_not_played(self):
         stop = threading.Event()
         stop.set()
-        synthesize, play = Mock(), Mock()
-        SpeechSynthesizer(synthesize=synthesize, play=play, fallback=Mock()).speak("Hola", stop)
-        synthesize.assert_not_called()
-        play.assert_not_called()
+        source = FakeSource(["a"])
+        self.synthesizer(source).speak("Hola", stop)
+        self.assertEqual((source.asked, collect.played), ([], []))
 
     def test_voice_speaks_in_background_and_can_be_interrupted(self):
         started, finished = threading.Event(), threading.Event()
