@@ -32,8 +32,18 @@ class ProcessInfo:
     name: str
 
 
+@dataclass(frozen=True)
+class MemoryItem:
+    id: int
+    text: str
+
+
 class AudioOutputUnavailable(OSError):
     """Windows carece de una salida de audio predeterminada."""
+
+
+class MemoryFull(Exception):
+    """La memoria alcanzó el máximo de recuerdos permitidos."""
 
 
 class FolderRedirected(PermissionError):
@@ -47,6 +57,10 @@ class LocalTools(Protocol):
     def read_volume(self) -> VolumeStatus: ...
     def set_volume(self, percent: int) -> VolumeStatus: ...
     def list_processes(self) -> list[ProcessInfo]: ...
+    def save_memory(self, text: str) -> int: ...
+    def list_memories(self) -> list[MemoryItem]: ...
+    def forget_memory(self, memory_id: int) -> bool: ...
+    def clear_memories(self) -> int: ...
 
 
 class ToolId(StrEnum):
@@ -56,6 +70,10 @@ class ToolId(StrEnum):
     READ_VOLUME = "audio.volume"
     SET_VOLUME = "audio.set_volume"
     LIST_PROCESSES = "system.processes"
+    SAVE_MEMORY = "memory.save"
+    LIST_MEMORIES = "memory.list"
+    FORGET_MEMORY = "memory.forget"
+    CLEAR_MEMORIES = "memory.clear"
 
 
 class Permission(Enum):
@@ -65,6 +83,10 @@ class Permission(Enum):
     READ_VOLUME = "audio.volume.read"
     SET_VOLUME = "audio.volume.write"
     READ_PROCESSES = "system.processes.read"
+    SAVE_MEMORY = "memory.write"
+    READ_MEMORY = "memory.read"
+    FORGET_MEMORY = "memory.forget"
+    CLEAR_MEMORY = "memory.clear"
 
 
 DEFAULT_PERMISSIONS = frozenset({
@@ -74,7 +96,13 @@ DEFAULT_PERMISSIONS = frozenset({
     Permission.READ_VOLUME,
     Permission.SET_VOLUME,
     Permission.READ_PROCESSES,
+    Permission.SAVE_MEMORY,
+    Permission.READ_MEMORY,
+    Permission.FORGET_MEMORY,
+    Permission.CLEAR_MEMORY,
 })
+
+MAX_MEMORY_TEXT = 300
 
 
 @dataclass(frozen=True)
@@ -83,12 +111,15 @@ class ArgumentSpec:
     value_type: type
     allowed_values: tuple[object, ...] = ()
     bounds: tuple[int, int] | None = None
+    max_length: int | None = None
 
     def accepts(self, value: object) -> bool:
         if type(value) is not self.value_type:
             return False
         if self.allowed_values and value not in self.allowed_values:
             return False
+        if self.max_length is not None:
+            return 0 < len(cast(str, value).strip()) <= self.max_length
         if self.bounds is not None:
             minimum, maximum = self.bounds
             return minimum <= cast(int, value) <= maximum
@@ -172,6 +203,34 @@ def _list_processes(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
     return ToolOutcome(0, "completada", "\n".join(rows))
 
 
+def _save_memory(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
+    text = " ".join(cast(str, arguments["text"]).split())
+    memory_id = tools.save_memory(text)
+    return ToolOutcome(0, "completada", f"Lo recordaré (recuerdo {memory_id}): {text}")
+
+
+def _list_memories(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
+    memories = tools.list_memories()
+    if not memories:
+        return ToolOutcome(0, "completada", "Todavía no recuerdo nada sobre ti.")
+    rows = ["Esto es lo que recuerdo:"]
+    rows.extend(f"{memory.id}. {memory.text}" for memory in memories)
+    rows.append("Di «olvida el recuerdo N» para borrar uno.")
+    return ToolOutcome(0, "completada", "\n".join(rows))
+
+
+def _forget_memory(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
+    memory_id = cast(int, arguments["memory_id"])
+    if tools.forget_memory(memory_id):
+        return ToolOutcome(0, "completada", f"Olvidé el recuerdo {memory_id}.")
+    return ToolOutcome(2, "no_encontrada", f"No tengo un recuerdo con el número {memory_id}.")
+
+
+def _clear_memories(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
+    removed = tools.clear_memories()
+    return ToolOutcome(0, "completada", f"Olvidé {removed} recuerdos y el historial de conversación.")
+
+
 TOOLS: Mapping[ToolId, ToolSpec] = MappingProxyType({
     tool.id: tool for tool in (
         ToolSpec(
@@ -218,6 +277,37 @@ TOOLS: Mapping[ToolId, ToolSpec] = MappingProxyType({
             permission=Permission.READ_PROCESSES,
             error_target="listar los procesos",
             handler=_list_processes,
+        ),
+        ToolSpec(
+            id=ToolId.SAVE_MEMORY,
+            permission=Permission.SAVE_MEMORY,
+            error_target="guardar el recuerdo",
+            handler=_save_memory,
+            parameters=(ArgumentSpec("text", str, max_length=MAX_MEMORY_TEXT),),
+            invalid_arguments="Indica qué debo recordar, en menos de 300 caracteres.",
+        ),
+        ToolSpec(
+            id=ToolId.LIST_MEMORIES,
+            permission=Permission.READ_MEMORY,
+            error_target="leer la memoria",
+            handler=_list_memories,
+        ),
+        ToolSpec(
+            id=ToolId.FORGET_MEMORY,
+            permission=Permission.FORGET_MEMORY,
+            error_target="borrar el recuerdo",
+            handler=_forget_memory,
+            parameters=(ArgumentSpec("memory_id", int, bounds=(1, 2**31 - 1)),),
+            invalid_arguments="Indica el número del recuerdo. Ejemplo «olvida el recuerdo 3».",
+        ),
+        ToolSpec(
+            id=ToolId.CLEAR_MEMORIES,
+            permission=Permission.CLEAR_MEMORY,
+            error_target="borrar la memoria",
+            handler=_clear_memories,
+            approval_preview=lambda args: (
+                "Borrar todos los recuerdos y el historial de conversación de JARVIS."
+            ),
         ),
     )
 })

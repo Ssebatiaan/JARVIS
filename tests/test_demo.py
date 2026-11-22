@@ -161,6 +161,7 @@ class DemoTests(unittest.TestCase):
         commands = (
             "abre el Bloc de notas", "abre la carpeta del proyecto", "consulta CPU y RAM",
             "consulta el volumen", "pon el volumen al 35 %", "lista procesos",
+            "recuerda que me llamo Ana", "qué recuerdas", "olvida el recuerdo 1", "olvida todo",
         )
         for command in commands:
             with self.subTest(command=command):

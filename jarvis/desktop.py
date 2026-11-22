@@ -6,7 +6,7 @@ from time import monotonic
 from tkinter import ttk
 
 from .audit import Audit
-from .core import ApprovalRequest, Result, normalize, run_command
+from .core import ApprovalRequest, Brain, Result, normalize, run_command
 from .tools import LocalTools
 from .tray import SystemTray
 
@@ -48,10 +48,13 @@ class _Task:
         raise KeyboardInterrupt
 
 
-def _run_task(text: str, tools: LocalTools, audit: Audit, task: _Task) -> None:
+def _run_task(
+    text: str, tools: LocalTools, audit: Audit, task: _Task, brain: Brain | None = None
+) -> None:
     try:
         result = run_command(
-            text, tools, audit, approve=task.approve, cancel_requested=task.cancelled.is_set
+            text, tools, audit, approve=task.approve, cancel_requested=task.cancelled.is_set,
+            brain=brain,
         )
     except Exception:
         result = Result(1, "La orden se detuvo. Revisa la auditoría antes de repetirla.")
@@ -59,10 +62,11 @@ def _run_task(text: str, tools: LocalTools, audit: Audit, task: _Task) -> None:
 
 
 class DesktopWindow:
-    def __init__(self, root: tk.Tk, tools: LocalTools, audit: Audit):
+    def __init__(self, root: tk.Tk, tools: LocalTools, audit: Audit, brain: Brain | None = None):
         self.root = root
         self.tools = tools
         self.audit = audit
+        self.brain = brain
         self._task: _Task | None = None
         self._approval: _Approval | None = None
         self._tray: SystemTray | None = None
@@ -156,6 +160,7 @@ class DesktopWindow:
         for label, command in (
             ("CPU y RAM", "consulta CPU y RAM"),
             ("Volumen", "consulta el volumen"),
+            ("Memoria", "qué recuerdas"),
             ("Ayuda", "ayuda"),
         ):
             button = ttk.Button(
@@ -262,7 +267,7 @@ class DesktopWindow:
         self._set_busy(True)
         self._set_output("")
         self.status.set("En ejecución")
-        worker = Thread(target=_run_task, args=(text, self.tools, self.audit, task))
+        worker = Thread(target=_run_task, args=(text, self.tools, self.audit, task, self.brain))
         try:
             worker.start()
         except RuntimeError:
@@ -336,14 +341,23 @@ class DesktopWindow:
             self.cancel()
 
 
-def run_window(tools: LocalTools, audit: Audit) -> int:
+def _warm_up(brain) -> None:
+    try:
+        brain.warm_up()
+    except Exception:
+        pass  # La primera orden libre volverá a intentarlo.
+
+
+def run_window(tools: LocalTools, audit: Audit, brain=None) -> int:
     try:
         root = tk.Tk()
     except tk.TclError:
         print("No se pudo abrir la ventana de JARVIS.")
         return 1
-    window = DesktopWindow(root, tools, audit)
+    window = DesktopWindow(root, tools, audit, brain)
     window.enable_tray()
+    if brain is not None and hasattr(brain, "warm_up"):
+        Thread(target=_warm_up, args=(brain,), daemon=True).start()
     try:
         root.mainloop()
     finally:

@@ -8,7 +8,8 @@ from pathlib import Path
 from time import sleep
 
 from .audio import read_default_volume, set_default_volume
-from .tools import FolderRedirected, LocalFolder, ProcessInfo, SystemUsage, VolumeStatus
+from .memory import MemoryStore
+from .tools import FolderRedirected, LocalFolder, MemoryItem, ProcessInfo, SystemUsage, VolumeStatus
 
 TH32CS_SNAPPROCESS = 0x00000002
 ERROR_NO_MORE_FILES = 18
@@ -47,9 +48,10 @@ class ProcessEntry(ct.Structure):
 
 
 class WindowsTools:
-    def __init__(self):
+    def __init__(self, memory: MemoryStore | None = None):
         if os.name != "nt":
             raise OSError("Se requiere Windows.")
+        self._memory = memory
 
         kernel = ct.WinDLL("kernel32.dll", use_last_error=True)
         self._system_directory = kernel.GetSystemDirectoryW
@@ -127,6 +129,23 @@ class WindowsTools:
             return processes
         finally:
             self._close_handle(snapshot)
+
+    def _memory_store(self) -> MemoryStore:
+        if self._memory is None:
+            raise OSError("La memoria de JARVIS no está disponible.")
+        return self._memory
+
+    def save_memory(self, text: str) -> int:
+        return self._memory_store().add_fact(text)
+
+    def list_memories(self) -> list[MemoryItem]:
+        return self._memory_store().facts()
+
+    def forget_memory(self, memory_id: int) -> bool:
+        return self._memory_store().forget_fact(memory_id)
+
+    def clear_memories(self) -> int:
+        return self._memory_store().forget_everything()
 
     def _cpu_times(self) -> tuple[int, int]:
         idle = wintypes.FILETIME()
