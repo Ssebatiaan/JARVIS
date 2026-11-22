@@ -11,9 +11,12 @@ from tkinter import font as tkfont
 
 from .audit import Audit
 from .core import ApprovalRequest, Brain, Result, normalize, run_command
-from .hotkey import HOTKEY_LABEL, GlobalHotkey, HotkeyUnavailable
+from .hotkey import (
+    HOTKEY_ID, HOTKEY_LABEL, LISTEN_HOTKEY_LABEL, VK_K, GlobalHotkey, HotkeyUnavailable,
+)
 from .tools import LocalTools
 from .tray import SystemTray
+from .voice import VoiceUnavailable
 
 # Paleta HUD
 BACKGROUND = "#0a1016"
@@ -26,8 +29,13 @@ CYAN = "#4fd8ff"
 AMBER = "#ffb547"
 GREEN = "#5ee6a0"
 RED = "#ff6b6b"
+LISTEN = "#ff5c8a"
 APPROVAL_SURFACE = "#1f1a0f"
 FONT = "Segoe UI"
+# Íconos nativos de Windows 11 (Segoe Fluent Icons) o Windows 10 (Segoe MDL2 Assets).
+ICON_SEND, ICON_MIC, ICON_STOP = "\ue724", "\ue720", "\ue71a"
+ICON_VOLUME, ICON_MUTE, ICON_HIDE = "\ue767", "\ue74f", "\ue921"
+SPEECH_SETTING = "voz.respuestas"
 
 WIDTH = 720
 MAX_OUTPUT_LINES = 16
@@ -42,8 +50,10 @@ STATE_COLORS = {
     "Error": RED,
     "Detenido": AMBER,
     "Cancelado": MUTED,
+    "Escuchando…": LISTEN,
+    "Transcribiendo…": CYAN,
 }
-BUSY_STATES = {"En ejecución", "Cancelando…"}
+BUSY_STATES = {"En ejecución", "Cancelando…", "Transcribiendo…"}
 RESULT_STATUSES = {0: "Completado", 1: "Error", 2: "Detenido", 130: "Cancelado"}
 
 
@@ -81,6 +91,28 @@ class _Task:
         raise KeyboardInterrupt
 
 
+@dataclass
+class _Listen:
+    stop: Event = field(default_factory=Event)
+    transcribing: Event = field(default_factory=Event)
+    events: SimpleQueue = field(default_factory=SimpleQueue)
+    cancelled: bool = False
+    level: float = 0.0
+
+    def set_level(self, level: float) -> None:
+        self.level = level
+
+
+def _listen_task(voice, listen: _Listen) -> None:
+    try:
+        text = voice.listen(listen.stop, on_level=listen.set_level, on_transcribing=listen.transcribing.set)
+        listen.events.put(("text", text))
+    except VoiceUnavailable as error:
+        listen.events.put(("error", str(error)))
+    except Exception:
+        listen.events.put(("error", "No pude usar el micrófono."))
+
+
 def _run_task(
     text: str, tools: LocalTools, audit: Audit, task: _Task, brain: Brain | None = None
 ) -> None:
@@ -109,6 +141,8 @@ class _Orb:
             0, 0, 0, 0, style="arc", width=max(2, size // 14), start=0, extent=110,
         )
         self._phase = 0.0
+        self.level = 0.0
+        self._smoothed = 0.0
 
     def draw(self, state: str, step: float) -> None:
         self._phase += step
@@ -116,6 +150,9 @@ class _Orb:
         busy = state in BUSY_STATES
         speed = 5.0 if busy else 1.6 if state == "Requiere aprobación" else 1.1
         pulse = (math.sin(self._phase * speed) + 1) / 2
+        if state == "Escuchando…":
+            self._smoothed += (min(1.0, self.level * 14) - self._smoothed) * 0.35
+            pulse = 0.25 + 0.75 * self._smoothed
         center = self.size / 2
         base = self.size * 0.2
         radius = base * (1 + 0.12 * pulse)
@@ -137,11 +174,18 @@ class _Orb:
 
 
 class DesktopWindow:
-    def __init__(self, root: tk.Tk, tools: LocalTools, audit: Audit, brain: Brain | None = None):
+    def __init__(self, root: tk.Tk, tools: LocalTools, audit: Audit, brain: Brain | None = None,
+                 voice=None, preferences=None):
         self.root = root
         self.tools = tools
         self.audit = audit
         self.brain = brain
+        self.voice = voice
+        self.preferences = preferences
+        self._listen: _Listen | None = None
+        self._listen_hotkey: GlobalHotkey | None = None
+        stored = preferences.get_setting(SPEECH_SETTING, "1") if preferences is not None else "1"
+        self.speak_enabled = voice is not None and stored == "1"
         self.hide_on_blur = False
         self._task: _Task | None = None
         self._approval: _Approval | None = None
@@ -185,8 +229,14 @@ class DesktopWindow:
             font=(FONT, 10, "bold" if bold else "normal"), padx=self._px(12), pady=self._px(5),
         )
 
+    def _icon_button(self, parent, icon, command, color):
+        button = self._flat_button(parent, icon, command, foreground=color)
+        button.configure(font=(self._icon_font, 12), padx=self._px(9))
+        return button
+
     def _build(self) -> None:
         families = set(tkfont.families(self.root))
+        self._icon_font = "Segoe Fluent Icons" if "Segoe Fluent Icons" in families else "Segoe MDL2 Assets"
         mono = "Cascadia Mono" if "Cascadia Mono" in families else "Consolas"
         pad = self._px(14)
 
@@ -215,16 +265,25 @@ class DesktopWindow:
         self.entry.bind("<Return>", lambda event: self.submit())
         self.entry.bind("<Up>", lambda event: self._browse_history(-1))
         self.entry.bind("<Down>", lambda event: self._browse_history(1))
+        self.entry.bind("<Tab>", self._tab_listen)
 
         self.status_label = tk.Label(
             bar, textvariable=self.status, background=SURFACE, font=(FONT, 9, "bold"),
         )
         self.status_label.grid(row=0, column=2, padx=(self._px(10), self._px(4)))
-        self.execute_button = self._flat_button(bar, "⏎", self.submit, foreground=CYAN)
-        self.execute_button.grid(row=0, column=3)
-        self.hide_button = self._flat_button(bar, "—", self.hide_to_tray)
+        self.mic_button = self._icon_button(bar, ICON_MIC, self.start_listening, CYAN)
+        self.mic_button.grid(row=0, column=3)
+        self.speaker_button = self._icon_button(bar, ICON_VOLUME, self.toggle_speech, MUTED)
+        self.speaker_button.grid(row=0, column=4)
+        self.execute_button = self._icon_button(bar, ICON_SEND, self.submit, CYAN)
+        self.execute_button.grid(row=0, column=5)
+        self.hide_button = self._icon_button(bar, ICON_HIDE, self.hide_to_tray, MUTED)
         self.hide_button.configure(state="disabled")
-        self.hide_button.grid(row=0, column=4)
+        self.hide_button.grid(row=0, column=6)
+        if self.voice is None:
+            self.mic_button.configure(state="disabled")
+            self.speaker_button.configure(state="disabled")
+        self._refresh_speaker()
 
         self.divider = tk.Frame(self.frame, background=DIVIDER, height=1)
         self.divider.grid(row=1, column=0, sticky="ew")
@@ -263,7 +322,8 @@ class DesktopWindow:
         footer.columnconfigure(0, weight=1)
         self.hint = tk.Label(
             footer, background=BACKGROUND, foreground=MUTED, font=(FONT, 9), anchor="w",
-            text=f"Enter ejecutar · Esc ocultar · ↑↓ historial · {HOTKEY_LABEL} mostrar",
+            text=(f"Enter ejecutar · Tab hablar · Esc ocultar · ↑↓ historial · "
+                  f"{HOTKEY_LABEL} escribir · {LISTEN_HOTKEY_LABEL} hablar"),
         )
         self.hint.grid(row=0, column=0, sticky="ew", padx=pad, pady=self._px(6))
         self.cancel_button = self._flat_button(
@@ -371,6 +431,16 @@ class DesktopWindow:
         except (OSError, HotkeyUnavailable):
             self._hotkey = None
             self.hint.configure(text=f"No pude registrar {HOTKEY_LABEL}: otro programa ya lo usa.")
+        if self.voice is not None:
+            try:
+                self._listen_hotkey = GlobalHotkey(
+                    self.root, self.listen_from_hotkey, key=VK_K, hotkey_id=HOTKEY_ID + 1,
+                )
+            except (OSError, HotkeyUnavailable):
+                self._listen_hotkey = None
+                self.hint.configure(
+                    text=f"No pude registrar {LISTEN_HOTKEY_LABEL}: otro programa ya lo usa."
+                )
         self._refresh_hide_button()
         return self._hotkey is not None
 
@@ -418,7 +488,7 @@ class DesktopWindow:
 
     def _hide_if_blurred(self) -> None:
         self._blur_after = None
-        if not self.hide_on_blur or self._closing or self._task is not None:
+        if not self.hide_on_blur or self._closing or self._task is not None or self._listen is not None:
             return
         try:
             focused = self.root.focus_get()
@@ -440,9 +510,16 @@ class DesktopWindow:
         if self._hotkey is not None:
             self._hotkey.close()
             self._hotkey = None
+        if self._listen_hotkey is not None:
+            self._listen_hotkey.close()
+            self._listen_hotkey = None
 
     def _escape(self) -> None:
-        if self._approval is not None:
+        if self._listen is not None:
+            self.cancel_listening()
+        elif self.voice is not None and self._task is None and self.voice.speaking:
+            self.voice.stop_speaking()
+        elif self._approval is not None:
             self._answer(False)
         elif self._task is not None:
             self.cancel()
@@ -458,6 +535,95 @@ class DesktopWindow:
         self.entry.icursor("end")
         return "break"
 
+    # --- voz ----------------------------------------------------------------------------
+
+    def _refresh_speaker(self) -> None:
+        self.speaker_button.configure(
+            text=ICON_VOLUME if self.speak_enabled else ICON_MUTE,
+            foreground=CYAN if self.speak_enabled else MUTED,
+        )
+
+    def toggle_speech(self) -> None:
+        if self.voice is None:
+            return
+        self.speak_enabled = not self.speak_enabled
+        if not self.speak_enabled:
+            self.voice.stop_speaking()
+        if self.preferences is not None:
+            try:
+                self.preferences.set_setting(SPEECH_SETTING, "1" if self.speak_enabled else "0")
+            except Exception:
+                pass
+        self._refresh_speaker()
+
+    def _tab_listen(self, event=None) -> str:
+        self.start_listening()
+        return "break"
+
+    def listen_from_hotkey(self) -> None:
+        if self.root.state() == "withdrawn":
+            self.show_from_tray()
+        self.start_listening()
+
+    def start_listening(self) -> None:
+        """Empieza a escuchar; si ya escucha, termina la grabación y transcribe lo dicho."""
+        if self.voice is None:
+            self._set_output("La voz no está instalada. Abre JARVIS con el entorno .venv del proyecto.")
+            return
+        if self._listen is not None:
+            self._listen.stop.set()
+            return
+        if self._task is not None or self._closing:
+            return
+        listen = _Listen()
+        self._listen = listen
+        self.voice.stop_speaking()
+        self.command.set("")
+        self._set_output("")
+        self.entry.configure(state="disabled")
+        self.execute_button.configure(state="disabled")
+        self.mic_button.configure(text=ICON_STOP, foreground=LISTEN)
+        self.status.set("Escuchando…")
+        if self.brain is not None and hasattr(self.brain, "warm_up"):
+            Thread(target=_warm_up, args=(self.brain,), daemon=True).start()
+        Thread(target=_listen_task, args=(self.voice, listen), daemon=True).start()
+        self.root.after(30, self._poll_listen)
+
+    def cancel_listening(self) -> None:
+        if self._listen is not None:
+            self._listen.cancelled = True
+            self._listen.stop.set()
+
+    def _poll_listen(self) -> None:
+        listen = self._listen
+        if listen is None:
+            return
+        self.orb.level = listen.level
+        if listen.transcribing.is_set() and self.status.get() == "Escuchando…":
+            self.status.set("Transcribiendo…")
+        try:
+            kind, value = listen.events.get_nowait()
+        except Empty:
+            self.root.after(30, self._poll_listen)
+            return
+        self._listen = None
+        self.orb.level = 0.0
+        self.mic_button.configure(text=ICON_MIC, foreground=CYAN)
+        self._set_busy(False)
+        if self._closing:
+            return
+        if listen.cancelled:
+            self.status.set("Listo")
+        elif kind == "error":
+            self.status.set("Error")
+            self._set_output(value)
+        elif not value:
+            self.status.set("Listo")
+            self._set_output(f"No te escuché. Pulsa Tab o {LISTEN_HOTKEY_LABEL} para intentarlo de nuevo.")
+        else:
+            self.command.set(value)
+            self.submit()
+
     # --- tareas -------------------------------------------------------------------------
 
     def submit(self) -> None:
@@ -467,6 +633,8 @@ class DesktopWindow:
         if normalize(text) == "salir":
             self.close()
             return
+        if self.voice is not None:
+            self.voice.stop_speaking()
         if not self._history or self._history[-1] != text:
             self._history.append(text)
         self._history_index = len(self._history)
@@ -545,8 +713,13 @@ class DesktopWindow:
         self.command.set("")
         self._set_output(result.message)
         self.entry.focus_set()
+        if self.speak_enabled and self.voice is not None and result.message:
+            self.voice.say(result.message)
 
     def _destroy(self) -> None:
+        self.cancel_listening()
+        if self.voice is not None:
+            self.voice.stop_speaking()
         for after_id in (self._animation_after, self._blur_after):
             if after_id is not None:
                 try:
@@ -579,7 +752,8 @@ def _enable_dpi_awareness() -> None:
         pass
 
 
-def run_window(tools: LocalTools, audit: Audit, brain=None, *, start_hidden: bool = False) -> int:
+def run_window(tools: LocalTools, audit: Audit, brain=None, *, start_hidden: bool = False,
+               voice=None, preferences=None) -> int:
     _enable_dpi_awareness()
     try:
         root = tk.Tk()
@@ -587,7 +761,7 @@ def run_window(tools: LocalTools, audit: Audit, brain=None, *, start_hidden: boo
         print("No se pudo abrir la ventana de JARVIS.")
         return 1
     root.withdraw()
-    window = DesktopWindow(root, tools, audit, brain)
+    window = DesktopWindow(root, tools, audit, brain, voice, preferences)
     window.hide_on_blur = True
     window.enable_tray()
     window.enable_hotkey()

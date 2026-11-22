@@ -71,6 +71,7 @@ def main(argv: list[str] | None = None, *, audit_path: Path | None = None) -> in
     mode.add_argument("orden", nargs="?", help="Orden entre comillas. Sin orden abre la consola.")
     mode.add_argument("--ventana", action="store_true", help="Abre la ventana de escritorio.")
     parser.add_argument("--sin-ia", action="store_true", help="Usa solo órdenes fijas, sin IA.")
+    parser.add_argument("--sin-voz", action="store_true", help="Desactiva el micrófono y la voz.")
     parser.add_argument(
         "--oculto", action="store_true",
         help="Con --ventana, arranca oculto en la bandeja. Muéstralo con AltGr+J.",
@@ -94,21 +95,31 @@ def main(argv: list[str] | None = None, *, audit_path: Path | None = None) -> in
         return 1
 
     brain = None if args.sin_ia else _create_brain(memory)
+    voice = None
+    if args.ventana and not args.sin_voz:
+        from .voice import create_voice
+
+        voice = create_voice()
     try:
-        return _run_mode(args, tools, audit, brain)
+        return _run_mode(args, tools, audit, brain, voice, memory)
     finally:
+        if voice is not None:
+            voice.close()
         if brain is not None:
             brain.close()
 
 
-def _run_mode(args: argparse.Namespace, tools: LocalTools, audit: Audit, brain: ClaudeBrain | None) -> int:
+def _run_mode(
+    args: argparse.Namespace, tools: LocalTools, audit: Audit, brain: ClaudeBrain | None,
+    voice=None, memory: MemoryStore | None = None,
+) -> int:
     if args.ventana:
         try:
             from .desktop import run_window
         except ImportError:
             print("La ventana requiere una instalación de Python con Tkinter.")
             return 1
-        return run_window(tools, audit, brain, start_hidden=args.oculto)
+        return run_window(tools, audit, brain, start_hidden=args.oculto, voice=voice, preferences=memory)
 
     if args.orden is not None:
         result = _run_console_command(args.orden, tools, audit, brain)

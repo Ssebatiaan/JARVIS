@@ -1,0 +1,7 @@
+# Voz (opcional). Sin estos paquetes JARVIS funciona solo por texto.
+# Versiones probadas en Windows 11 con Python 3.11.
+faster-whisper==1.2.1
+# faster-whisper 1.2.1 no es compatible con PyAV 19.
+av>=11,<19
+sounddevice==0.5.6
+edge-tts==7.3.1

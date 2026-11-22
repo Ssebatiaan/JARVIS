@@ -1,0 +1,248 @@
+import importlib.util
+import os
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+from time import monotonic, sleep
+from unittest.mock import Mock
+
+from jarvis.audit import Audit
+from jarvis.tools import LocalTools, SystemUsage
+from jarvis.voice import SpeechRecognizer, SpeechSynthesizer, Voice, record_until_silence, speakable
+
+HAS_NUMPY = importlib.util.find_spec("numpy") is not None
+try:
+    import tkinter as tk
+    from jarvis.desktop import DesktopWindow
+except ImportError:
+    tk = None
+
+
+class SpeakableTests(unittest.TestCase):
+    def test_reads_numbers_units_and_symbols_naturally(self):
+        self.assertEqual(
+            speakable("CPU 5.9 % · RAM 9.34 de 15.34 GiB."),
+            "CPU 5,9 por ciento. RAM 9,34 de 15,34 gigas.",
+        )
+        self.assertEqual(speakable("Lo recordaré: «Se llama Ana» 🙂"), "Lo recordaré: Se llama Ana")
+
+    def test_tables_are_summarised_instead_of_read(self):
+        table = "Procesos en la captura de Windows\n       PID  Ejecutable\n         4  System\nTotal de procesos: 3."
+        self.assertEqual(speakable(table), "Procesos en la captura de Windows. Te dejo el detalle en pantalla.")
+
+    def test_long_answers_are_cut_at_a_sentence(self):
+        text = ("Esta es una frase de prueba bastante larga para el asistente. " * 12).strip()
+        spoken = speakable(text)
+        self.assertLessEqual(len(spoken), 420)
+        self.assertTrue(spoken.endswith("."))
+        self.assertEqual(speakable("   "), "")
+
+
+@unittest.skipUnless(HAS_NUMPY, "Requiere numpy (entorno .venv)")
+class RecordTests(unittest.TestCase):
+    def blocks(self, pattern):
+        import numpy as np
+
+        rng = np.random.default_rng(1)
+        for kind in pattern:
+            amplitude = 0.002 if kind == "-" else 0.2
+            yield (rng.standard_normal(1600) * amplitude).astype(np.float32)
+
+    def test_stops_after_a_pause_following_speech(self):
+        levels = []
+        audio = record_until_silence(threading.Event(), blocks=self.blocks("---" + "#" * 8 + "-" * 30),
+                                     on_level=levels.append)
+        self.assertIsNotNone(audio)
+        self.assertEqual(len(audio), 1600 * (3 + 8 + 10))
+        self.assertGreater(max(levels), 0.1)
+
+    def test_returns_none_when_nobody_speaks(self):
+        self.assertIsNone(record_until_silence(threading.Event(), blocks=self.blocks("-" * 80)))
+
+    def test_stop_ends_early_and_keeps_what_was_said(self):
+        stop = threading.Event()
+
+        def source():
+            for index, block in enumerate(self.blocks("---" + "#" * 50)):
+                if index == 6:
+                    stop.set()
+                yield block
+
+        audio = record_until_silence(stop, blocks=source())
+        self.assertEqual(len(audio), 1600 * 7)
+
+
+class RecognizerTests(unittest.TestCase):
+    def fake_model(self, *texts):
+        model = Mock()
+        model.transcribe.return_value = ([Mock(text=text) for text in texts], None)
+        return model
+
+    def test_loads_on_demand_uses_vocabulary_and_unloads_when_idle(self):
+        model = self.fake_model(" Hola Jarvis,", " abre el Bloc de notas. ")
+        factory = Mock(return_value=model)
+        recognizer = SpeechRecognizer(factory=factory, idle_seconds=0.2)
+        self.assertFalse(recognizer.loaded)
+        self.assertEqual(recognizer.transcribe(b"audio"), "Hola Jarvis, abre el Bloc de notas.")
+        self.assertEqual(model.transcribe.call_args.kwargs["language"], "es")
+        self.assertIn("Jarvis", model.transcribe.call_args.kwargs["initial_prompt"])
+        deadline = monotonic() + 3
+        while recognizer.loaded and monotonic() < deadline:
+            sleep(0.02)
+        self.assertFalse(recognizer.loaded)
+        factory.assert_called_once()
+
+    def test_known_whisper_hallucinations_are_discarded(self):
+        recognizer = SpeechRecognizer(factory=lambda: self.fake_model("Subtítulos realizados por Amara.org"))
+        self.assertEqual(recognizer.transcribe(b"ruido"), "")
+        recognizer.unload()
+
+
+class SynthesizerTests(unittest.TestCase):
+    def test_plays_neural_voice_and_falls_back_to_windows_without_internet(self):
+        play, fallback = Mock(), Mock()
+        SpeechSynthesizer(synthesize=lambda text: ("audio", 24000), play=play, fallback=fallback).speak(
+            "Volumen 40 %.", threading.Event())
+        play.assert_called_once()
+        fallback.assert_not_called()
+        failing = Mock(side_effect=OSError("sin red"))
+        SpeechSynthesizer(synthesize=failing, play=play, fallback=fallback).speak("Hola", threading.Event())
+        fallback.assert_called_once()
+        self.assertEqual(fallback.call_args.args[0], "Hola")
+
+    def test_stopped_speech_is_not_played(self):
+        stop = threading.Event()
+        stop.set()
+        synthesize, play = Mock(), Mock()
+        SpeechSynthesizer(synthesize=synthesize, play=play, fallback=Mock()).speak("Hola", stop)
+        synthesize.assert_not_called()
+        play.assert_not_called()
+
+    def test_voice_speaks_in_background_and_can_be_interrupted(self):
+        started, finished = threading.Event(), threading.Event()
+
+        def slow_speak(text, stop):
+            started.set()
+            stop.wait(3)
+            finished.set()
+
+        voice = Voice(recognizer=Mock(), synthesizer=Mock(speak=slow_speak))
+        voice.say("Hola")
+        self.assertTrue(started.wait(2))
+        self.assertTrue(voice.speaking)
+        voice.stop_speaking()
+        self.assertTrue(finished.wait(2))
+        self.assertFalse(voice.speaking)
+
+    def test_listen_returns_none_without_speech_and_transcribes_otherwise(self):
+        recognizer = Mock(transcribe=Mock(return_value="hola"))
+        voice = Voice(recognizer=recognizer, synthesizer=Mock(), record=lambda stop, on_level=None: None)
+        self.assertIsNone(voice.listen(threading.Event()))
+        recognizer.transcribe.assert_not_called()
+        transcribing = Mock()
+        voice = Voice(recognizer=recognizer, synthesizer=Mock(), record=lambda stop, on_level=None: b"a")
+        self.assertEqual(voice.listen(threading.Event(), on_transcribing=transcribing), "hola")
+        transcribing.assert_called_once_with()
+
+
+class FakeVoice:
+    def __init__(self, heard):
+        self.heard = heard
+        self.said = []
+        self.speaking = False
+        self.stops = 0
+
+    def listen(self, stop, *, on_level=None, on_transcribing=None):
+        if on_level:
+            on_level(0.05)
+        if on_transcribing:
+            on_transcribing()
+        return self.heard
+
+    def say(self, text):
+        self.said.append(text)
+
+    def stop_speaking(self):
+        self.stops += 1
+
+
+class FakePreferences:
+    def __init__(self, value="1"):
+        self.values = {"voz.respuestas": value}
+
+    def get_setting(self, key, default=None):
+        return self.values.get(key, default)
+
+    def set_setting(self, key, value):
+        self.values[key] = value
+
+
+@unittest.skipUnless(os.name == "nt" and tk is not None, "Requiere Windows con Tkinter")
+class DesktopVoiceTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.audit = Audit(Path(temporary.name) / "auditoria.sqlite3")
+        self.tools = Mock(spec=LocalTools)
+        self.tools.read_usage.return_value = SystemUsage(7, 8 * 1024**3, 4 * 1024**3)
+        try:
+            self.root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest(f"Sesión gráfica no disponible: {error}")
+        self.root.withdraw()
+        self.addCleanup(self.close)
+
+    def close(self):
+        try:
+            self.window.close()
+        except (AttributeError, tk.TclError):
+            pass
+
+    def make(self, voice, preferences=None):
+        self.window = DesktopWindow(self.root, self.tools, self.audit, voice=voice, preferences=preferences)
+        return self.window
+
+    def wait_until(self, condition):
+        deadline = monotonic() + 4
+        while not condition():
+            self.root.update()
+            if monotonic() >= deadline:
+                self.fail("La ventana no alcanzó el estado esperado.")
+            sleep(0.01)
+
+    def test_spoken_order_runs_and_the_answer_is_read_aloud(self):
+        voice = FakeVoice("consulta CPU y RAM")
+        window = self.make(voice, FakePreferences("1"))
+        window.mic_button.invoke()
+        self.wait_until(lambda: window.status.get() == "Completado")
+        self.tools.read_usage.assert_called_once_with()
+        self.assertEqual(len(voice.said), 1)
+        self.assertIn("4.00 de 8.00 GiB", voice.said[0])
+
+    def test_speaker_toggle_is_remembered_and_silences_answers(self):
+        voice = FakeVoice("consulta CPU y RAM")
+        preferences = FakePreferences("1")
+        window = self.make(voice, preferences)
+        window.speaker_button.invoke()
+        self.assertEqual(preferences.values["voz.respuestas"], "0")
+        window.mic_button.invoke()
+        self.wait_until(lambda: window.status.get() == "Completado")
+        self.assertEqual(voice.said, [])
+
+    def test_nothing_heard_shows_a_hint_without_running_tools(self):
+        window = self.make(FakeVoice(None), FakePreferences())
+        window.mic_button.invoke()
+        self.wait_until(lambda: window._listen is None)
+        self.assertIn("No te escuché", window.output.get("1.0", "end"))
+        self.assertEqual(self.tools.mock_calls, [])
+
+    def test_without_voice_packages_the_buttons_are_disabled(self):
+        window = self.make(None)
+        self.assertEqual(str(window.mic_button["state"]), "disabled")
+        self.assertEqual(str(window.speaker_button["state"]), "disabled")
+        self.assertFalse(window.speak_enabled)
+
+
+if __name__ == "__main__":
+    unittest.main()

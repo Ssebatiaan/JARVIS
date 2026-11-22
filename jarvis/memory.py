@@ -34,6 +34,9 @@ class MemoryStore:
             "id INTEGER PRIMARY KEY, user_text TEXT NOT NULL, reply TEXT NOT NULL, "
             "created_at TEXT NOT NULL)"
         )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
         return connection
 
     @staticmethod
@@ -91,3 +94,17 @@ class MemoryStore:
                 "SELECT user_text, reply FROM history ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
         return [Exchange(row[0], row[1]) for row in reversed(rows)]
+
+    def get_setting(self, key: str, default: str | None = None) -> str | None:
+        """Preferencias de la interfaz. «olvida todo» no las borra."""
+        with closing(self._connect()) as connection:
+            row = connection.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
