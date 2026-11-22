@@ -23,6 +23,20 @@ except ImportError:
 VK_F24 = 0x87
 TEST_MODIFIERS = MOD_CONTROL | MOD_ALT | MOD_SHIFT
 
+def release_tk(test):
+    """Suelta las referencias a Tk y recolecta en el hilo principal.
+
+    unittest libera cada prueba al terminar; si el recolector de basura destruyera después la
+    ventana desde un hilo de trabajo, Tcl abortaría el proceso («Tcl_AsyncDelete»).
+    """
+    import gc
+
+    for name in ("window", "root"):
+        if hasattr(test, name):
+            setattr(test, name, None)
+    gc.collect()
+
+
 
 class HotkeyPollingTests(unittest.TestCase):
     def setUp(self):
@@ -58,6 +72,7 @@ class HotkeyWindowsTests(unittest.TestCase):
         except tk.TclError as error:
             self.skipTest(f"Sesión gráfica no disponible: {error}")
         self.root.withdraw()
+        self.addCleanup(release_tk, self)
         self.addCleanup(self.root.destroy)
 
     def register(self, callback, hotkey_id=HOTKEY_ID + 1):

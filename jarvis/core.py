@@ -9,9 +9,10 @@ from uuid import uuid4
 
 from .audit import Audit
 from .brain import BrainUnavailable, Decision
+from .web import site_key
+from . import persona as jarvis_persona
 from .tools import (
     DEFAULT_PERMISSIONS,
-    NOTEPAD,
     TOOLS,
     AudioOutputUnavailable,
     FolderRedirected,
@@ -29,7 +30,6 @@ from .tools import ProcessInfo as ProcessInfo
 from .tools import SystemUsage as SystemUsage
 from .tools import VolumeStatus as VolumeStatus
 
-APP_ALIASES = {"bloc de notas": NOTEPAD, "notepad": NOTEPAD}
 FOLDER_ALIASES = {
     "del proyecto": LocalFolder.PROJECT,
     "proyecto": LocalFolder.PROJECT,
@@ -43,7 +43,34 @@ VOLUME_SET_PREFIXES = ("pon el volumen", "ajusta el volumen")
 VOLUME_SET_PATTERN = re.compile(r"(?:pon|ajusta) el volumen al ([0-9]{1,3})(?: ?%)?")
 PROCESS_COMMANDS = {"lista procesos", "listar procesos"}
 REMEMBER_PREFIXES = ("recuerda que ", "recuerda: ")
-REMEMBER_PATTERN = re.compile(r"\s*[¿¡]?\s*recuerda(?:\s+que|\s*:)\s*(.*?)\s*[.!]?\s*$", re.IGNORECASE | re.DOTALL)
+REMEMBER_PATTERN = re.compile(
+    r"\s*(?:jarvis[\s,:]+)?[¿¡]?\s*recuerda(?:\s+que|\s*:)\s*(.*?)\s*[.!]?\s*$", re.IGNORECASE | re.DOTALL
+)
+WAKE_PREFIX = re.compile(r"^(?:oye |hey |ok )?jarvis[\s,:.!]+(?=\S)")
+MEDIA_COMMANDS = {
+    "play_pause": {"pausa", "pausa la musica", "pausa la cancion", "pausa el video", "reanuda",
+                   "reanuda la musica", "continua la musica", "play", "dale play", "pon play"},
+    "next": {"siguiente", "siguiente cancion", "la siguiente", "pasa la cancion", "salta la cancion",
+             "siguiente tema", "cambia la cancion"},
+    "previous": {"anterior", "cancion anterior", "la anterior", "vuelve a la cancion anterior"},
+    "mute": {"silencia", "silencia el audio", "mutea", "quita el silencio"},
+}
+TIME_COMMANDS = {
+    "que hora es", "dime la hora", "que hora tenemos", "que dia es hoy", "que fecha es hoy",
+    "a que estamos hoy", "que dia es", "que fecha es",
+}
+MINIMIZE_COMMANDS = {"minimiza todo", "minimiza todas las ventanas", "muestra el escritorio"}
+YOUTUBE_PLAY = (
+    re.compile(r"(?:abre youtube y )?(?:reproduce|pon|ponme|reproduceme)(?: la cancion| el video| la musica)? (.+?) en youtube"),
+    re.compile(r"abre youtube y (?:reproduce|pon|ponme|reproduceme)(?: la cancion| el video| la musica)? (.+)"),
+)
+SEARCH_PATTERN = re.compile(r"(?:busca|buscame) (.+?) en (google|youtube|wikipedia)")
+YOUTUBE_SEARCH = re.compile(r"abre youtube y busca (.+)")
+FOCUS_PATTERNS = (
+    re.compile(r"(?:cambia a|cambiate a|ve a|trae al frente|pon al frente|muestrame) (.+)"),
+    re.compile(r"(?:pon|trae) (.+?) al frente"),
+)
+CLOSE_PATTERN = re.compile(r"cierra (?:la ventana de |la ventana del |el |la )?(.+)")
 MEMORY_LIST_COMMANDS = {
     "que recuerdas", "que recuerdas de mi", "que sabes de mi", "lista recuerdos",
     "muestra tu memoria", "muestra tus recuerdos",
@@ -60,10 +87,11 @@ BRAIN_ACTION = "assistant.brain"
 CANCELLED_BEFORE_EXECUTION = ToolOutcome(130, "cancelada", "Paso cancelado antes de ejecutar.")
 
 HELP = (
-    "Comandos: «abre el Bloc de notas», «consulta CPU y RAM», «consulta el volumen», "
-    "«pon el volumen al 35 %», «lista procesos», «abre la carpeta del proyecto», "
-    "«abre la carpeta de documentación», «recuerda que…», «qué recuerdas», "
-    "«olvida el recuerdo N», «olvida todo», «ayuda» y «salir». "
+    "Puedo abrir aplicaciones («abre Discord»), sitios («abre YouTube»), reproducir en YouTube "
+    "(«reproduce Back in Black en YouTube»), buscar («busca recetas en Google»), controlar la música "
+    "(«pausa», «siguiente canción»), manejar ventanas («cambia a Opera», «cierra Discord», "
+    "«minimiza todo»), consultar CPU, RAM y volumen, ajustar el volumen, listar procesos y "
+    "recordar cosas («recuerda que…», «qué recuerdas», «olvida el recuerdo N»). "
     "Encadena hasta cinco órdenes con «y luego»."
 )
 
@@ -117,8 +145,28 @@ class _Execution:
         self.audit.record(self.request_id, action, status, elapsed_ms, step_index=step_index)
 
 
+def _restore(original: str | None, fragment: str) -> str:
+    """Recupera del texto original un fragmento reconocido en su forma normalizada.
+
+    Así una búsqueda conserva tildes y mayúsculas («café», «Queen») aunque la orden se
+    reconozca sin ellas.
+    """
+    if not original:
+        return fragment
+    chars, positions = [], []
+    for index, char in enumerate(original):
+        for piece in (" " if char.isspace() else normalize(char)):
+            chars.append(piece)
+            positions.append(index)
+    words = [re.escape(word) for word in fragment.split()]
+    match = re.search(r"\s+".join(words), "".join(chars)) if words else None
+    if match is None:
+        return fragment
+    return original[positions[match.start()]: positions[match.end() - 1] + 1].strip()
+
+
 def _route(command: str, original: str | None = None) -> RoutedCommand:
-    command = command.strip(" ¿?¡!.")
+    command = WAKE_PREFIX.sub("", command.strip(" ¿?¡!.")).strip(" ¿?¡!.")
     if command.startswith(REMEMBER_PREFIXES):
         match = REMEMBER_PATTERN.match(original if original is not None else command)
         return ToolId.SAVE_MEMORY, {"text": match[1] if match else ""}
@@ -138,13 +186,42 @@ def _route(command: str, original: str | None = None) -> RoutedCommand:
         return ToolId.SET_VOLUME, {"percent": int(match[1]) if match else None}
     if command in PROCESS_COMMANDS:
         return ToolId.LIST_PROCESSES, {}
+    for action, phrases in MEDIA_COMMANDS.items():
+        if command in phrases:
+            return ToolId.MEDIA, {"action": action}
+    if command in MINIMIZE_COMMANDS:
+        return ToolId.MINIMIZE_ALL, {}
+    if command in TIME_COMMANDS:
+        return ToolId.TIME, {}
+    for pattern in YOUTUBE_PLAY:
+        match = pattern.fullmatch(command)
+        if match:
+            return ToolId.PLAY_YOUTUBE, {"query": _restore(original, match[1])}
+    match = YOUTUBE_SEARCH.fullmatch(command)
+    if match:
+        return ToolId.WEB_SEARCH, {"engine": "youtube", "query": _restore(original, match[1])}
+    match = SEARCH_PATTERN.fullmatch(command)
+    if match:
+        return ToolId.WEB_SEARCH, {"engine": match[2], "query": _restore(original, match[1])}
+    for pattern in FOCUS_PATTERNS:
+        match = pattern.fullmatch(command)
+        if match:
+            return ToolId.FOCUS_WINDOW, {"app": match[1]}
+    match = CLOSE_PATTERN.fullmatch(command)
+    if match and " y " not in match[1]:
+        return ToolId.CLOSE_WINDOW, {"app": match[1]}
 
     verb, _, argument = command.partition(" ")
-    if verb in {"abre", "abrir"}:
+    if verb in {"abre", "abrir", "abreme", "inicia", "ejecuta", "lanza"} and argument:
         target_type, _, folder_alias = argument.removeprefix("la ").partition(" ")
         if target_type == "carpeta":
             return ToolId.OPEN_FOLDER, {"folder": FOLDER_ALIASES.get(folder_alias)}
-        return ToolId.OPEN_APP, {"app_id": APP_ALIASES.get(argument.removeprefix("el "))}
+        site = site_key(argument)
+        if site is not None:
+            return ToolId.OPEN_SITE, {"site": site}
+        if " y " in argument:
+            return None, {}  # órdenes compuestas: mejor que las interprete la IA
+        return ToolId.OPEN_APP, {"app": argument}
     return None, {}
 
 
@@ -337,9 +414,12 @@ def _route_from_model(tool: str, arguments: dict) -> RoutedCommand:
     except ValueError:
         return None, {}
     converted: dict[str, object] = dict(arguments)
-    app = converted.get("app_id")
-    if tool_id is ToolId.OPEN_APP and isinstance(app, str):
-        converted["app_id"] = APP_ALIASES.get(normalize(app).removeprefix("el "), app)
+    site = converted.get("site")
+    if tool_id is ToolId.OPEN_SITE and isinstance(site, str):
+        converted["site"] = site_key(site) or site
+    engine = converted.get("engine")
+    if tool_id is ToolId.WEB_SEARCH and isinstance(engine, str):
+        converted["engine"] = normalize(engine)
     folder = converted.get("folder")
     if tool_id is ToolId.OPEN_FOLDER and isinstance(folder, str):
         converted["folder"] = FOLDER_ALIASES.get(normalize(folder).removeprefix("la carpeta "), folder)
@@ -351,7 +431,9 @@ def _notify_memory(brain: "Brain | None", route: RoutedCommand, result: Result) 
         brain.notify_memory_changed()
 
 
-def _run_with_brain(text: str, tools: LocalTools, execution: _Execution, brain: Brain) -> Result:
+def _run_with_brain(
+    text: str, tools: LocalTools, execution: _Execution, brain: Brain, persona: bool = False
+) -> Result:
     started = perf_counter()
     try:
         execution.record(BRAIN_ACTION, "recibida")
@@ -380,7 +462,12 @@ def _run_with_brain(text: str, tools: LocalTools, execution: _Execution, brain: 
         route = _route_from_model(decision.tool, decision.arguments)
         step = _run_step(route, tools, execution)
         _notify_memory(brain, route, step)
-        messages.append(step.message)
+        if persona and decision.reply and step.code == 0:
+            messages.append(f"{decision.reply} {step.message}")
+        elif persona:
+            messages.append(jarvis_persona.dress(route[0], step.code, step.message))
+        else:
+            messages.append(step.message)
         code, source = step.code, "tool"
 
     if decision.remember:
@@ -405,6 +492,7 @@ def run_command(
     approve: Approver | None = None,
     cancel_requested: Callable[[], bool] | None = None,
     brain: Brain | None = None,
+    persona: bool = False,
 ) -> Result:
     started = perf_counter()
     command = normalize(text)
@@ -415,9 +503,12 @@ def run_command(
     if SEQUENCE_SEPARATOR not in command:
         route = _route(command, text)
         if route[0] is None and brain is not None:
-            return _run_with_brain(text, tools, execution, brain)
+            return _run_with_brain(text, tools, execution, brain, persona)
         result = _run_step(route, tools, execution)
         _notify_memory(brain, route, result)
+        if persona:
+            result = Result(result.code, jarvis_persona.dress(route[0], result.code, result.message),
+                            result.elapsed_ms)
         if brain is not None:
             brain.observe(text, result.message, source="direct")
         return result

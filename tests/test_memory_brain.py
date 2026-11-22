@@ -180,11 +180,11 @@ class CoreWithBrainTests(unittest.TestCase):
         self.assertEqual(self.tools.mock_calls, [])
 
     def test_model_folder_names_are_mapped_to_authorized_folders_only(self):
-        result = run_command("ábreme el proyecto", self.tools, self.audit,
+        result = run_command("llévame a lo del proyecto", self.tools, self.audit,
                              brain=FakeBrain(Decision("folders.open", {"folder": "proyecto"}, "")))
         self.assertEqual(result.code, 0)
         self.tools.open_folder.assert_called_once_with(LocalFolder.PROJECT)
-        result = run_command("abre windows", self.tools, self.audit,
+        result = run_command("quiero ver lo de windows", self.tools, self.audit,
                              brain=FakeBrain(Decision("folders.open", {"folder": "C:/Windows"}, "")))
         self.assertEqual(result.code, 2)
         self.tools.open_folder.assert_called_once()

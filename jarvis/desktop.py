@@ -11,6 +11,7 @@ from tkinter import font as tkfont
 
 from .audit import Audit
 from .core import ApprovalRequest, Brain, Result, normalize, run_command
+from .persona import welcome
 from .hotkey import (
     HOTKEY_ID, HOTKEY_LABEL, LISTEN_HOTKEY_LABEL, VK_K, GlobalHotkey, HotkeyUnavailable,
 )
@@ -119,7 +120,7 @@ def _run_task(
     try:
         result = run_command(
             text, tools, audit, approve=task.approve, cancel_requested=task.cancelled.is_set,
-            brain=brain,
+            brain=brain, persona=True,
         )
     except Exception:
         result = Result(1, "La orden se detuvo. Revisa la auditoría antes de repetirla.")
@@ -184,6 +185,7 @@ class DesktopWindow:
         self.preferences = preferences
         self._listen: _Listen | None = None
         self._listen_hotkey: GlobalHotkey | None = None
+        self._greeted = False
         stored = preferences.get_setting(SPEECH_SETTING, "1") if preferences is not None else "1"
         self.speak_enabled = voice is not None and stored == "1"
         self.hide_on_blur = False
@@ -459,6 +461,8 @@ class DesktopWindow:
         self._fit()
         self._focus()
         self._warm_voice()
+        if self.hide_on_blur:
+            self.root.after(250, self.greet)
         if self.brain is not None and hasattr(self.brain, "warm_up"):
             Thread(target=_warm_up, args=(self.brain,), daemon=True).start()
 
@@ -538,6 +542,16 @@ class DesktopWindow:
 
     # --- voz ----------------------------------------------------------------------------
 
+    def greet(self) -> None:
+        """Saludo de JARVIS la primera vez que se muestra la barra."""
+        if self._greeted or self._task is not None or self._listen is not None:
+            return
+        self._greeted = True
+        message = welcome()
+        self._set_output(message)
+        if self.speak_enabled and self.voice is not None:
+            self.voice.say(message)
+
     def _warm_voice(self) -> None:
         """Abre la conexión de la voz mientras JARVIS escucha o trabaja (ahorra ~0,8 s)."""
         if self.speak_enabled and self.voice is not None and hasattr(self.voice, "warm"):
@@ -567,6 +581,7 @@ class DesktopWindow:
         return "break"
 
     def listen_from_hotkey(self) -> None:
+        self._greeted = True  # quien llama para hablar no necesita el saludo
         if self.root.state() == "withdrawn":
             self.show_from_tray()
         self.start_listening()
@@ -778,6 +793,7 @@ def run_window(tools: LocalTools, audit: Audit, brain=None, *, start_hidden: boo
             Thread(target=_warm_up, args=(brain,), daemon=True).start()
     else:
         window.show_from_tray()
+        window.greet()
     try:
         root.mainloop()
     finally:

@@ -18,6 +18,20 @@ try:
 except ImportError:
     tk = None
 
+def release_tk(test):
+    """Suelta las referencias a Tk y recolecta en el hilo principal.
+
+    unittest libera cada prueba al terminar; si el recolector de basura destruyera después la
+    ventana desde un hilo de trabajo, Tcl abortaría el proceso («Tcl_AsyncDelete»).
+    """
+    import gc
+
+    for name in ("window", "root"):
+        if hasattr(test, name):
+            setattr(test, name, None)
+    gc.collect()
+
+
 
 class SpeakableTests(unittest.TestCase):
     def test_reads_numbers_units_and_symbols_naturally(self):
@@ -235,6 +249,7 @@ class DesktopVoiceTests(unittest.TestCase):
         except tk.TclError as error:
             self.skipTest(f"Sesión gráfica no disponible: {error}")
         self.root.withdraw()
+        self.addCleanup(release_tk, self)
         self.addCleanup(self.close)
 
     def close(self):

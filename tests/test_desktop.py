@@ -18,6 +18,20 @@ except ImportError:
     tk = None
     DesktopWindow = None
 
+def release_tk(test):
+    """Suelta las referencias a Tk y recolecta en el hilo principal.
+
+    unittest libera cada prueba al terminar; si el recolector de basura destruyera después la
+    ventana desde un hilo de trabajo, Tcl abortaría el proceso («Tcl_AsyncDelete»).
+    """
+    import gc
+
+    for name in ("window", "root"):
+        if hasattr(test, name):
+            setattr(test, name, None)
+    gc.collect()
+
+
 
 @unittest.skipUnless(os.name == "nt" and tk is not None, "Requiere Windows con Tkinter")
 class DesktopTests(unittest.TestCase):
@@ -31,6 +45,7 @@ class DesktopTests(unittest.TestCase):
         except tk.TclError as error:
             self.skipTest(f"Sesión gráfica no disponible: {error}")
         self.root.withdraw()
+        self.addCleanup(release_tk, self)
         self.window = DesktopWindow(self.root, self.tools, Audit(self.audit_path))
         self.root.update_idletasks()
         self.addCleanup(self.close_window)

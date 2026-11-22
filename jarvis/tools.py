@@ -1,11 +1,22 @@
-import unicodedata
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum, StrEnum
 from types import MappingProxyType
 from typing import Protocol, cast
 
-NOTEPAD = "notepad"
+from .text import normalize as normalize
+
+# Sitios y buscadores permitidos: las claves válidas para web.open y web.search.
+SITE_KEYS = (
+    "youtube", "youtube music", "google", "gmail", "github", "whatsapp web", "netflix", "twitch",
+    "chatgpt", "claude", "drive", "google drive", "maps", "google maps", "wikipedia", "instagram",
+    "x", "twitter", "reddit",
+)
+SEARCH_ENGINE_KEYS = ("google", "youtube", "wikipedia")
+MEDIA_ACTIONS = ("play_pause", "next", "previous", "stop", "mute")
+# Un nombre de aplicación o ventana, nunca una ruta ni una orden.
+NAME_PATTERN = r"[^\\/:*?\"<>|;&]{1,80}"
 
 
 class LocalFolder(Enum):
@@ -50,8 +61,32 @@ class FolderRedirected(PermissionError):
     """La entrada autorizada representa un enlace o un punto de redirección."""
 
 
+class TargetNotFound(LookupError):
+    """No hay una aplicación instalada o ventana abierta con ese nombre."""
+
+    def __init__(self, query: str, suggestions: list[str]):
+        super().__init__(query)
+        self.query = query
+        self.suggestions = suggestions
+
+
+class TargetAmbiguous(LookupError):
+    """Varias aplicaciones coinciden por igual con el nombre pedido."""
+
+    def __init__(self, query: str, options: list[str]):
+        super().__init__(query)
+        self.query = query
+        self.options = options
+
+
 class LocalTools(Protocol):
-    def open_notepad(self) -> int: ...
+    def launch_app(self, name: str) -> str: ...
+    def focus_window(self, name: str) -> str: ...
+    def close_window(self, name: str) -> str: ...
+    def minimize_all(self) -> None: ...
+    def media_key(self, action: str) -> None: ...
+    def open_url(self, url: str) -> None: ...
+    def find_video(self, query: str) -> tuple[str, str] | None: ...
     def open_folder(self, folder: LocalFolder) -> None: ...
     def read_usage(self) -> SystemUsage: ...
     def read_volume(self) -> VolumeStatus: ...
@@ -74,6 +109,14 @@ class ToolId(StrEnum):
     LIST_MEMORIES = "memory.list"
     FORGET_MEMORY = "memory.forget"
     CLEAR_MEMORIES = "memory.clear"
+    FOCUS_WINDOW = "windows.focus"
+    CLOSE_WINDOW = "windows.close"
+    MINIMIZE_ALL = "windows.minimize_all"
+    MEDIA = "media.control"
+    OPEN_SITE = "web.open"
+    WEB_SEARCH = "web.search"
+    PLAY_YOUTUBE = "youtube.play"
+    TIME = "system.time"
 
 
 class Permission(Enum):
@@ -87,6 +130,14 @@ class Permission(Enum):
     READ_MEMORY = "memory.read"
     FORGET_MEMORY = "memory.forget"
     CLEAR_MEMORY = "memory.clear"
+    MANAGE_WINDOWS = "windows.manage"
+    CLOSE_WINDOWS = "windows.close"
+    MINIMIZE_WINDOWS = "windows.minimize"
+    MEDIA = "media.control"
+    OPEN_SITE = "web.open"
+    WEB_SEARCH = "web.search"
+    PLAY_YOUTUBE = "youtube.play"
+    READ_TIME = "system.time.read"
 
 
 DEFAULT_PERMISSIONS = frozenset({
@@ -100,6 +151,14 @@ DEFAULT_PERMISSIONS = frozenset({
     Permission.READ_MEMORY,
     Permission.FORGET_MEMORY,
     Permission.CLEAR_MEMORY,
+    Permission.MANAGE_WINDOWS,
+    Permission.CLOSE_WINDOWS,
+    Permission.MINIMIZE_WINDOWS,
+    Permission.MEDIA,
+    Permission.OPEN_SITE,
+    Permission.WEB_SEARCH,
+    Permission.PLAY_YOUTUBE,
+    Permission.READ_TIME,
 })
 
 MAX_MEMORY_TEXT = 300
@@ -112,11 +171,14 @@ class ArgumentSpec:
     allowed_values: tuple[object, ...] = ()
     bounds: tuple[int, int] | None = None
     max_length: int | None = None
+    pattern: str | None = None
 
     def accepts(self, value: object) -> bool:
         if type(value) is not self.value_type:
             return False
         if self.allowed_values and value not in self.allowed_values:
+            return False
+        if self.pattern is not None and not re.fullmatch(self.pattern, cast(str, value).strip()):
             return False
         if self.max_length is not None:
             return 0 < len(cast(str, value).strip()) <= self.max_length
@@ -152,15 +214,104 @@ class ToolSpec:
         return all(parameter.accepts(arguments[parameter.name]) for parameter in self.parameters)
 
 
-def normalize(text: str) -> str:
-    decomposed = unicodedata.normalize("NFD", text.casefold())
-    plain = "".join(char for char in decomposed if not unicodedata.combining(char))
-    return " ".join(plain.split())
+def _not_found(error: LookupError, what: str) -> ToolOutcome:
+    if isinstance(error, TargetAmbiguous):
+        options = ", ".join(f"«{option}»" for option in error.options)
+        return ToolOutcome(2, "ambigua", f"Hay varias coincidencias para «{error.query}»: {options}. ¿Cuál?")
+    query = getattr(error, "query", "")
+    suggestions = getattr(error, "suggestions", [])
+    hint = f" ¿Quizás {', '.join(f'«{item}»' for item in suggestions)}?" if suggestions else ""
+    return ToolOutcome(2, "no_encontrada", f"No encontré «{query}» {what}.{hint}")
 
 
 def _open_app(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
-    pid = tools.open_notepad()
-    return ToolOutcome(0, "completada", f"Windows inició el proceso del Bloc de notas (PID {pid}).")
+    try:
+        name = tools.launch_app(cast(str, arguments["app"]).strip())
+    except LookupError as error:
+        return _not_found(error, "entre tus aplicaciones instaladas")
+    return ToolOutcome(0, "solicitada", f"Abriendo {name}.")
+
+
+def _focus_window(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
+    try:
+        title = tools.focus_window(cast(str, arguments["app"]).strip())
+    except LookupError as error:
+        return _not_found(error, "entre las ventanas abiertas")
+    return ToolOutcome(0, "completada", f"Traje al frente «{title}».")
+
+
+def _close_window(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
+    try:
+        title = tools.close_window(cast(str, arguments["app"]).strip())
+    except LookupError as error:
+        return _not_found(error, "entre las ventanas abiertas")
+    return ToolOutcome(0, "solicitada", f"Pedí cerrar «{title}».")
+
+
+def _minimize_all(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
+    tools.minimize_all()
+    return ToolOutcome(0, "solicitada", "Minimicé las ventanas.")
+
+
+MEDIA_LABELS = {
+    "play_pause": "Pausé o reanudé la reproducción.",
+    "next": "Siguiente pista.",
+    "previous": "Pista anterior.",
+    "stop": "Detuve la reproducción.",
+    "mute": "Activé o desactivé el silencio.",
+}
+
+
+def _media(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
+    action = cast(str, arguments["action"])
+    tools.media_key(action)
+    return ToolOutcome(0, "solicitada", MEDIA_LABELS[action])
+
+
+def _open_site(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
+    from .web import SITES
+
+    label, url = SITES[cast(str, arguments["site"])]
+    tools.open_url(url)
+    return ToolOutcome(0, "solicitada", f"Abriendo {label}.")
+
+
+def _web_search(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
+    from .web import SEARCH_ENGINES, search_url
+
+    engine, query = cast(str, arguments["engine"]), cast(str, arguments["query"]).strip()
+    tools.open_url(search_url(engine, query))
+    return ToolOutcome(0, "solicitada", f"Buscando «{query}» en {SEARCH_ENGINES[engine][0]}.")
+
+
+WEEKDAYS = ("lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo")
+MONTHS = ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre",
+          "octubre", "noviembre", "diciembre")
+
+
+def describe_time(now) -> str:
+    article = "Es la" if now.hour % 12 == 1 else "Son las"
+    return (f"{article} {now:%H:%M} del {WEEKDAYS[now.weekday()]} {now.day} de "
+            f"{MONTHS[now.month - 1]} de {now.year}.")
+
+
+def _read_time(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
+    from datetime import datetime
+
+    return ToolOutcome(0, "completada", describe_time(datetime.now()))
+
+
+def _play_youtube(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
+    from .web import search_url
+
+    query = cast(str, arguments["query"]).strip()
+    found = tools.find_video(query)
+    if found is None:
+        tools.open_url(search_url("youtube", query))
+        return ToolOutcome(0, "solicitada", f"No pude elegir un video; abrí los resultados de «{query}» en YouTube.")
+    url, title = found
+    tools.open_url(url)
+    return ToolOutcome(0, "solicitada", f"Reproduciendo «{title}» en YouTube.")
 
 
 def _open_folder(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
@@ -212,7 +363,7 @@ def _save_memory(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
 def _list_memories(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
     memories = tools.list_memories()
     if not memories:
-        return ToolOutcome(0, "completada", "Todavía no recuerdo nada sobre ti.")
+        return ToolOutcome(0, "completada", "Todavía no recuerdo nada sobre usted.")
     rows = ["Esto es lo que recuerdo:"]
     rows.extend(f"{memory.id}. {memory.text}" for memory in memories)
     rows.append("Di «olvida el recuerdo N» para borrar uno.")
@@ -236,10 +387,76 @@ TOOLS: Mapping[ToolId, ToolSpec] = MappingProxyType({
         ToolSpec(
             id=ToolId.OPEN_APP,
             permission=Permission.OPEN_APP,
-            error_target="abrir el Bloc de notas",
+            error_target="abrir la aplicación",
             handler=_open_app,
-            parameters=(ArgumentSpec("app_id", str, allowed_values=(NOTEPAD,)),),
-            invalid_arguments="Aplicación no permitida. Puedes abrir el Bloc de notas.",
+            parameters=(ArgumentSpec("app", str, pattern=NAME_PATTERN),),
+            invalid_arguments="Indica el nombre de una aplicación instalada, sin rutas. Ejemplo «abre Discord».",
+        ),
+        ToolSpec(
+            id=ToolId.FOCUS_WINDOW,
+            permission=Permission.MANAGE_WINDOWS,
+            error_target="traer la ventana al frente",
+            handler=_focus_window,
+            parameters=(ArgumentSpec("app", str, pattern=NAME_PATTERN),),
+            invalid_arguments="Indica el nombre de la aplicación. Ejemplo «cambia a Discord».",
+        ),
+        ToolSpec(
+            id=ToolId.CLOSE_WINDOW,
+            permission=Permission.CLOSE_WINDOWS,
+            error_target="cerrar la ventana",
+            handler=_close_window,
+            parameters=(ArgumentSpec("app", str, pattern=NAME_PATTERN),),
+            invalid_arguments="Indica el nombre de la aplicación. Ejemplo «cierra Discord».",
+            approval_preview=lambda args: (
+                f"Cerrar la ventana de «{args['app']}». Si tiene cambios sin guardar, la aplicación lo preguntará."
+            ),
+        ),
+        ToolSpec(
+            id=ToolId.MINIMIZE_ALL,
+            permission=Permission.MINIMIZE_WINDOWS,
+            error_target="minimizar las ventanas",
+            handler=_minimize_all,
+        ),
+        ToolSpec(
+            id=ToolId.MEDIA,
+            permission=Permission.MEDIA,
+            error_target="enviar la tecla multimedia",
+            handler=_media,
+            parameters=(ArgumentSpec("action", str, allowed_values=MEDIA_ACTIONS),),
+            invalid_arguments="Acción multimedia no válida.",
+        ),
+        ToolSpec(
+            id=ToolId.OPEN_SITE,
+            permission=Permission.OPEN_SITE,
+            error_target="abrir el sitio",
+            handler=_open_site,
+            parameters=(ArgumentSpec("site", str, allowed_values=SITE_KEYS),),
+            invalid_arguments="Ese sitio no está en la lista permitida.",
+        ),
+        ToolSpec(
+            id=ToolId.WEB_SEARCH,
+            permission=Permission.WEB_SEARCH,
+            error_target="abrir la búsqueda",
+            handler=_web_search,
+            parameters=(
+                ArgumentSpec("engine", str, allowed_values=SEARCH_ENGINE_KEYS),
+                ArgumentSpec("query", str, max_length=200),
+            ),
+            invalid_arguments="Indica qué buscar y dónde: Google, YouTube o Wikipedia.",
+        ),
+        ToolSpec(
+            id=ToolId.TIME,
+            permission=Permission.READ_TIME,
+            error_target="consultar la hora",
+            handler=_read_time,
+        ),
+        ToolSpec(
+            id=ToolId.PLAY_YOUTUBE,
+            permission=Permission.PLAY_YOUTUBE,
+            error_target="reproducir en YouTube",
+            handler=_play_youtube,
+            parameters=(ArgumentSpec("query", str, max_length=200),),
+            invalid_arguments="Indica qué reproducir. Ejemplo «reproduce Back in Black en YouTube».",
         ),
         ToolSpec(
             id=ToolId.OPEN_FOLDER,

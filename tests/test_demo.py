@@ -24,7 +24,8 @@ from jarvis.core import (
     run_command,
 )
 from jarvis.windows import WindowsTools
-from jarvis.tools import DEFAULT_PERMISSIONS, TOOLS, Permission, ToolId
+from jarvis.apps import AppCatalog, InstalledApp
+from jarvis.tools import DEFAULT_PERMISSIONS, TOOLS, Permission, TargetNotFound, ToolId
 
 
 class DemoTests(unittest.TestCase):
@@ -41,26 +42,34 @@ class DemoTests(unittest.TestCase):
                 "SELECT request_id, action, status, elapsed_ms FROM events ORDER BY id"
             ).fetchall()
 
-    def test_opens_allowed_application_once_and_records_result(self):
-        self.tools.open_notepad.return_value = 42
+    def test_opens_an_installed_application_once_and_records_result(self):
+        self.tools.launch_app.return_value = "Bloc de notas"
         result = run_command("  Abre   el Blóc de Notas  ", self.tools, self.audit)
         self.assertEqual(result.code, 0)
-        self.assertIn("PID 42", result.message)
-        self.tools.open_notepad.assert_called_once_with()
+        self.assertEqual(result.message, "Abriendo Bloc de notas.")
+        self.tools.launch_app.assert_called_once_with("el bloc de notas")
         received, completed = self.audit_rows()
         self.assertEqual(received[0], completed[0])
         self.assertEqual(received[1:3], ("apps.open", "recibida"))
-        self.assertEqual(completed[1:3], ("apps.open", "completada"))
+        self.assertEqual(completed[1:3], ("apps.open", "solicitada"))
         self.assertGreaterEqual(completed[3], 0)
 
-    def test_denies_app_names_paths_and_extra_arguments(self):
-        for text in ("abre Firefox", "abre C:/Windows/notepad.exe", "abre notepad archivo.txt"):
+    def test_paths_and_chained_commands_are_never_launched(self):
+        for text in ("abre C:/Windows/notepad.exe", "abre notepad & del archivo", "abre ..\\evil"):
             with self.subTest(text=text):
                 result = run_command(text, self.tools, self.audit)
                 self.assertEqual(result.code, 2)
-                self.assertIn("no permitida", result.message)
-        self.tools.open_notepad.assert_not_called()
+                self.assertIn("sin rutas", result.message)
+        self.tools.launch_app.assert_not_called()
         self.assertEqual([row[2] for row in self.audit_rows()][1::2], ["denegada"] * 3)
+
+    def test_unknown_application_is_reported_with_suggestions(self):
+        self.tools.launch_app.side_effect = TargetNotFound("firefoz", ["Firefox"])
+        result = run_command("abre firefoz", self.tools, self.audit)
+        self.assertEqual(result.code, 2)
+        self.assertIn("No encontré «firefoz»", result.message)
+        self.assertIn("¿Quizás «Firefox»?", result.message)
+        self.assertEqual(self.audit_rows()[-1][1:3], ("apps.open", "no_encontrada"))
 
     def test_opens_only_named_project_folders_and_audits_the_request(self):
         for command, folder in (
@@ -136,7 +145,7 @@ class DemoTests(unittest.TestCase):
         self.assertIn("5.00 de 8.00 GiB", result.message)
         result = run_command("borrar carpeta", self.tools, self.audit)
         self.assertEqual(result.code, 2)
-        self.tools.open_notepad.assert_not_called()
+        self.tools.launch_app.assert_not_called()
         self.tools.read_usage.assert_called_once_with()
 
     def test_registry_declares_every_tool_and_its_own_permission(self):
@@ -162,6 +171,8 @@ class DemoTests(unittest.TestCase):
             "abre el Bloc de notas", "abre la carpeta del proyecto", "consulta CPU y RAM",
             "consulta el volumen", "pon el volumen al 35 %", "lista procesos",
             "recuerda que me llamo Ana", "qué recuerdas", "olvida el recuerdo 1", "olvida todo",
+            "cambia a Discord", "cierra Discord", "minimiza todo", "pausa", "abre YouTube",
+            "busca gatos en Google", "reproduce lofi en YouTube", "qué hora es",
         )
         for command in commands:
             with self.subTest(command=command):
@@ -187,7 +198,7 @@ class DemoTests(unittest.TestCase):
         approve.assert_not_called()
 
     def test_reports_os_error_without_logging_sensitive_text(self):
-        self.tools.open_notepad.side_effect = OSError(5, "dato sensible")
+        self.tools.launch_app.side_effect = OSError(5, "dato sensible")
         result = run_command("abre notepad", self.tools, self.audit)
         self.assertEqual(result.code, 1)
         self.assertIn("código 5", result.message)
@@ -449,20 +460,20 @@ class DemoTests(unittest.TestCase):
         result = run_command("abre notepad", self.tools, self.audit)
         self.assertEqual(result.code, 1)
         self.assertIn("Orden detenida", result.message)
-        self.tools.open_notepad.assert_not_called()
+        self.tools.launch_app.assert_not_called()
 
     def test_failed_final_audit_preserves_known_action_result(self):
-        self.tools.open_notepad.return_value = 42
+        self.tools.launch_app.return_value = "Bloc de notas"
         audit = Mock(spec=Audit)
         audit.record.side_effect = [None, OSError(5, "sin escritura")]
         result = run_command("abre notepad", self.tools, audit)
         self.assertEqual(result.code, 1)
-        self.assertIn("PID 42", result.message)
+        self.assertIn("Abriendo Bloc de notas", result.message)
         self.assertIn("No se pudo guardar", result.message)
-        self.tools.open_notepad.assert_called_once_with()
+        self.tools.launch_app.assert_called_once_with("notepad")
 
     @unittest.skipUnless(os.name == "nt", "Requiere Windows")
-    def test_windows_reads_real_metrics_and_launches_fixed_executable(self):
+    def test_windows_reads_real_metrics_and_launches_only_start_menu_apps(self):
         tools = WindowsTools()
         usage = tools.read_usage()
         self.assertLessEqual(0, usage.cpu_percent)
@@ -471,22 +482,26 @@ class DemoTests(unittest.TestCase):
         self.assertLessEqual(usage.ram_available_bytes, usage.ram_total_bytes)
         self.assertGreater(usage.ram_total_bytes, 0)
 
-        with patch.object(subprocess, "Popen") as launch:
-            launch.return_value.pid = 42
-            self.assertEqual(tools.open_notepad(), 42)
+        tools._apps = AppCatalog(loader=lambda: [
+            InstalledApp("Bloc de notas", "Microsoft.WindowsNotepad_8wekyb3d8bbwe!App"),
+            InstalledApp("Uninstall Zoom", "Microsoft.AutoGenerated.{2F48}"),
+        ])
+        with patch("jarvis.apps.subprocess.Popen") as launch:
+            self.assertEqual(tools.launch_app("el bloc de notas"), "Bloc de notas")
+            with self.assertRaises(TargetNotFound):
+                tools.launch_app("uninstall zoom")
         launch.assert_called_once()
-        args, kwargs = launch.call_args
-        executable = Path(kwargs["executable"])
-        self.assertTrue(executable.is_absolute())
-        self.assertEqual(executable.name.lower(), "notepad.exe")
-        self.assertEqual(args, ([str(executable)],))
-        self.assertFalse(kwargs["shell"])
+        self.assertEqual(launch.call_args.args[0],
+                         ["explorer.exe", "shell:AppsFolder\\Microsoft.WindowsNotepad_8wekyb3d8bbwe!App"])
+        with self.assertRaises(PermissionError):
+            tools.open_url("file:///C:/Windows/System32")
 
     @unittest.skipUnless(os.name == "nt", "Requiere Windows")
     def test_console_continues_after_denial_and_exits(self):
         output = io.StringIO()
-        with patch("builtins.input", side_effect=["abre Firefox", "consulta CPU y RAM", "salir"]):
+        with patch("builtins.input", side_effect=["abre C:/Windows/notepad.exe", "consulta CPU y RAM", "salir"]):
             with redirect_stdout(output):
-                self.assertEqual(main([], audit_path=self.path), 0)
-        self.assertIn("Aplicación no permitida", output.getvalue())
+                self.assertEqual(main(["--sin-ia"], audit_path=self.path), 0)
+        self.assertIn("Me temo que no ha sido posible, señor", output.getvalue())
+        self.assertIn("sin rutas", output.getvalue())
         self.assertIn("GiB", output.getvalue())

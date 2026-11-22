@@ -95,6 +95,7 @@ class TrayWindowsTests(unittest.TestCase):
         except Exception as error:
             self.skipTest(f"Sesión gráfica no disponible: {error}")
         root.withdraw()
+        self.addCleanup(__import__("gc").collect)
         self.addCleanup(root.destroy)
         shown = Mock()
         try:

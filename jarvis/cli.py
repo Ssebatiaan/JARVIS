@@ -28,7 +28,7 @@ def _run_console_command(
     text: str, tools: LocalTools, audit: Audit, brain: Brain | None = None
 ) -> Result:
     if SEQUENCE_SEPARATOR not in normalize(text) or current_thread() is not main_thread():
-        return run_command(text, tools, audit, approve=_confirm_approval, brain=brain)
+        return run_command(text, tools, audit, approve=_confirm_approval, brain=brain, persona=True)
 
     cancelled = False
     awaiting_approval = False
@@ -52,7 +52,9 @@ def _run_console_command(
     previous_handler = signal.signal(signal.SIGINT, interrupt)
     try:
         print("Tarea en curso. Pulsa Ctrl+C para cancelar los pasos pendientes.")
-        return run_command(text, tools, audit, approve=approve, cancel_requested=lambda: cancelled)
+        return run_command(
+            text, tools, audit, approve=approve, cancel_requested=lambda: cancelled, persona=True
+        )
     finally:
         signal.signal(signal.SIGINT, previous_handler)
 
@@ -94,6 +96,8 @@ def main(argv: list[str] | None = None, *, audit_path: Path | None = None) -> in
         print("No se pudo inicializar el acceso a las herramientas de Windows.")
         return 1
 
+    if hasattr(tools, "preload_apps"):
+        tools.preload_apps()
     brain = None if args.sin_ia else _create_brain(memory)
     voice = None
     if args.ventana and not args.sin_voz:

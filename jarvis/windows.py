@@ -7,8 +7,11 @@ from ctypes import wintypes
 from pathlib import Path
 from time import sleep
 
+from . import apps as app_catalog
 from .audio import read_default_volume, set_default_volume
+from .control import DesktopControl
 from .memory import MemoryStore
+from .web import find_youtube_video
 from .tools import FolderRedirected, LocalFolder, MemoryItem, ProcessInfo, SystemUsage, VolumeStatus
 
 TH32CS_SNAPPROCESS = 0x00000002
@@ -52,6 +55,8 @@ class WindowsTools:
         if os.name != "nt":
             raise OSError("Se requiere Windows.")
         self._memory = memory
+        self._apps = app_catalog.AppCatalog()
+        self._desktop: DesktopControl | None = None
 
         kernel = ct.WinDLL("kernel32.dll", use_last_error=True)
         self._system_directory = kernel.GetSystemDirectoryW
@@ -80,19 +85,39 @@ class WindowsTools:
         self._close_handle.argtypes = [wintypes.HANDLE]
         self._close_handle.restype = wintypes.BOOL
 
-    def open_notepad(self) -> int:
-        directory = ct.create_unicode_buffer(32768)
-        length = self._system_directory(directory, len(directory))
-        if length == 0:
-            raise ct.WinError(ct.get_last_error())
-        if length >= len(directory):
-            raise OSError("Directorio de sistema demasiado largo.")
+    def preload_apps(self) -> None:
+        """Carga en segundo plano la lista de aplicaciones del menú Inicio (~1,2 s)."""
+        self._apps.preload()
 
-        executable = str(Path(directory.value) / "notepad.exe")
-        process = subprocess.Popen(
-            [executable], executable=executable, cwd=directory.value, shell=False
-        )
-        return process.pid
+    def launch_app(self, name: str) -> str:
+        app = self._apps.find(name)
+        app_catalog.launch(app)
+        return app.name
+
+    def _control(self) -> DesktopControl:
+        if self._desktop is None:
+            self._desktop = DesktopControl()
+        return self._desktop
+
+    def focus_window(self, name: str) -> str:
+        return self._control().focus(name).title
+
+    def close_window(self, name: str) -> str:
+        return self._control().close(name).title
+
+    def minimize_all(self) -> None:
+        self._control().minimize_all()
+
+    def media_key(self, action: str) -> None:
+        self._control().media(action)
+
+    def open_url(self, url: str) -> None:
+        if not url.startswith("https://"):
+            raise PermissionError("Solo se abren direcciones https.")
+        os.startfile(url)  # navegador predeterminado
+
+    def find_video(self, query: str) -> tuple[str, str] | None:
+        return find_youtube_video(query)
 
     def open_folder(self, folder: LocalFolder) -> None:
         target = PROJECT_ROOT.resolve(strict=True) / PROJECT_FOLDERS[folder]

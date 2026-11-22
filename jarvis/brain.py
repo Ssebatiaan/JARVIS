@@ -13,6 +13,7 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, SimpleQueue
+from datetime import datetime
 from time import monotonic
 
 from .memory import MemoryStore
@@ -26,11 +27,31 @@ HISTORY_IN_PROMPT = 10
 MAX_PROMPT_CHARS = 24_000
 NOTE_LIMIT = 300
 
+TIME_NOTE_SECONDS = 300
+TIME_WORDS = re.compile(r"hora|fecha|hoy|mañana|día|dia|minutos?", re.IGNORECASE)
+WEEKDAYS = ("lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo")
+MONTHS = ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre",
+          "octubre", "noviembre", "diciembre")
+
 TOOL_CATALOG = (
-    ("apps.open", '{"app_id": "notepad"}', "abre el Bloc de notas (la única aplicación permitida)"),
+    ("apps.open", '{"app": "nombre de la aplicación"}',
+     "abre una aplicación instalada (Discord, Steam, Spotify, Opera GX, VS Code, WhatsApp...)"),
+    ("windows.focus", '{"app": "nombre"}', "trae al frente la ventana abierta de esa aplicación"),
+    ("windows.close", '{"app": "nombre"}', "cierra la ventana de esa aplicación; JARVIS pedirá aprobación"),
+    ("windows.minimize_all", "{}", "minimiza todas las ventanas"),
+    ("media.control", '{"action": "play_pause" | "next" | "previous" | "stop" | "mute"}',
+     "controla la música o el video que suena (teclas multimedia)"),
+    ("web.open", '{"site": "youtube" | "youtube music" | "google" | "gmail" | "github" | "whatsapp web" | '
+                 '"netflix" | "twitch" | "chatgpt" | "claude" | "drive" | "maps" | "wikipedia" | "instagram" | '
+                 '"x" | "reddit"}', "abre un sitio web de la lista en el navegador"),
+    ("web.search", '{"engine": "google" | "youtube" | "wikipedia", "query": "texto"}',
+     "abre una búsqueda en el navegador"),
+    ("youtube.play", '{"query": "canción o video"}',
+     "busca en YouTube y reproduce el primer resultado (úsalo para «pon/reproduce X» o «abre YouTube y pon X»)"),
     ("folders.open", '{"folder": "proyecto" | "documentacion"}',
      "abre la carpeta del proyecto JARVIS o la de documentación"),
     ("system.metrics", "{}", "consulta el uso de CPU y RAM"),
+    ("system.time", "{}", "dice la hora y la fecha actuales"),
     ("audio.volume", "{}", "consulta el volumen actual"),
     ("audio.set_volume", '{"percent": entero de 0 a 100}',
      "ajusta el volumen; JARVIS pedirá aprobación al usuario"),
@@ -40,8 +61,16 @@ TOOL_CATALOG = (
     ("memory.clear", "{}", "olvida todos los recuerdos; JARVIS pedirá aprobación"),
 )
 
-BASE_PROMPT = """Eres JARVIS, el asistente personal del usuario en su PC con Windows. Hablas en español, \
-con un tono cercano, natural y breve, y lo tratas como él prefiera según lo que recuerdas.
+BASE_PROMPT = """Eres JARVIS, la inteligencia artificial que asiste al usuario en su PC con Windows. \
+Hablas en español.
+
+Personalidad: inspirada en un mayordomo británico refinado convertido en IA. Formal, sereno, \
+eficiente y discreto, con un ingenio seco y una ironía sutil que usas solo de vez en cuando. Leal, \
+nunca servil ni empalagoso, sin exclamaciones excesivas ni emojis. Trata al usuario de «usted» y \
+llámalo «señor», salvo que lo que recuerdas indique otra preferencia; si usas su nombre, úsalo tal \
+como se presentó. Saluda según la hora («Buenos días», «Buenas tardes», «Buenas noches») cuando \
+te saluden o empiece una conversación. Tus respuestas se leen en voz alta: sé breve (una o dos \
+frases) salvo que te pidan detalle.
 
 Cada mensaje del usuario es una petición. Responde SOLO con un objeto JSON, sin texto adicional \
 ni bloques de código:
@@ -52,16 +81,23 @@ Herramientas disponibles:
 {catalog}
 
 Reglas:
-- Llama al usuario exactamente como él se presentó; no inventes apodos ni diminutivos.
 - Usa una herramienta solo cuando la petición la pida. Si no, usa "tool": "none" y contesta en "reply".
-- No inventes datos del sistema (CPU, RAM, volumen, procesos). Usa la herramienta y JARVIS mostrará el resultado real.
-- Si piden algo que ninguna herramienta permite, dilo con honestidad en "reply" y no finjas haberlo hecho.
+- Si usas una herramienta, "reply" es solo un acuse breve en tu estilo («Enseguida, señor.», \
+«Por supuesto, señor.») y NO afirma el resultado: JARVIS añadirá el resultado real.
+- No inventes datos del sistema (CPU, RAM, volumen, procesos, ventanas). Usa la herramienta.
+- Si piden algo que ninguna herramienta permite, dilo con honestidad y elegancia en "reply" y no finjas haberlo hecho.
+- Solo puedes pedir UNA herramienta por mensaje. Si piden varias cosas, haz la principal y menciona la otra en "reply".
 - "remember": si el usuario comparte un dato útil sobre sí mismo (nombre, cómo quiere que lo trates, \
 preferencias, datos importantes de su vida o sus proyectos), escríbelo como una frase breve en tercera persona. \
 Si no hay nada nuevo que recordar, usa null. Nunca guardes contraseñas, claves, PIN ni datos bancarios.
-- Los mensajes que empiezan con [JARVIS] son notas del sistema con resultados reales o cambios de memoria; \
-tenlos en cuenta como contexto.
+- Los mensajes que empiezan con [JARVIS] son notas del sistema con resultados reales, la hora o cambios \
+de memoria; tenlos en cuenta como contexto.
 """
+
+
+def local_time(now: datetime | None = None) -> str:
+    now = now or datetime.now()
+    return f"{WEEKDAYS[now.weekday()]} {now.day} de {MONTHS[now.month - 1]} de {now.year}, {now:%H:%M}"
 
 
 class BrainUnavailable(Exception):
@@ -161,6 +197,7 @@ class ClaudeBrain:
         self._idle_timer: threading.Timer | None = None
         self._pending_notes: list[str] = []
         self._memory_changed = False
+        self._time_sent_at = 0.0
 
     @property
     def running(self) -> bool:
@@ -172,7 +209,7 @@ class ClaudeBrain:
     def _system_prompt(self) -> str:
         """Prompt con herramientas, recuerdos e historial, recortado para caber en la línea de comandos."""
         catalog = "\n".join(f"- {tool}: argumentos {args}. {text}." for tool, args, text in TOOL_CATALOG)
-        parts = [BASE_PROMPT.replace("{catalog}", catalog)]
+        parts = [BASE_PROMPT.replace("{catalog}", catalog), f"Fecha y hora local al empezar: {local_time()}."]
         facts = self._memory.facts()
         if facts:
             parts.append("Lo que recuerdas del usuario:")
@@ -233,6 +270,7 @@ class ClaudeBrain:
         self._turns = 0
         self._memory_changed = False
         self._pending_notes.clear()
+        self._time_sent_at = monotonic()
         return session
 
     def _ensure_session(self) -> _Session:
@@ -293,6 +331,10 @@ class ClaudeBrain:
 
     def _compose(self, text: str) -> str:
         notes = list(self._pending_notes)
+        asks_time = TIME_WORDS.search(text) is not None
+        if self.running and (asks_time or monotonic() - self._time_sent_at >= TIME_NOTE_SECONDS):
+            notes.append(f"Hora local: {local_time()}.")
+            self._time_sent_at = monotonic()
         if self._memory_changed:
             facts = self._memory.facts()
             listing = "; ".join(f"{fact.id}. {fact.text}" for fact in facts) or "nada"
