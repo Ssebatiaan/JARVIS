@@ -1,0 +1,14 @@
+# Documentación local (no se sube)
+*.md
+docs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Datos locales y secretos
+*.sqlite3
+.env
+.claude/
