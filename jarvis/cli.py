@@ -71,6 +71,10 @@ def main(argv: list[str] | None = None, *, audit_path: Path | None = None) -> in
     mode.add_argument("orden", nargs="?", help="Orden entre comillas. Sin orden abre la consola.")
     mode.add_argument("--ventana", action="store_true", help="Abre la ventana de escritorio.")
     parser.add_argument("--sin-ia", action="store_true", help="Usa solo órdenes fijas, sin IA.")
+    parser.add_argument(
+        "--oculto", action="store_true",
+        help="Con --ventana, arranca oculto en la bandeja. Muéstralo con AltGr+J.",
+    )
     args = parser.parse_args(argv)
 
     if os.name != "nt":
@@ -104,7 +108,7 @@ def _run_mode(args: argparse.Namespace, tools: LocalTools, audit: Audit, brain: 
         except ImportError:
             print("La ventana requiere una instalación de Python con Tkinter.")
             return 1
-        return run_window(tools, audit, brain)
+        return run_window(tools, audit, brain, start_hidden=args.oculto)
 
     if args.orden is not None:
         result = _run_console_command(args.orden, tools, audit, brain)

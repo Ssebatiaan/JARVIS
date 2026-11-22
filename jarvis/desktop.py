@@ -1,24 +1,57 @@
+"""Barra flotante de JARVIS: aparece con el atajo global, ejecuta órdenes y muestra el resultado."""
+
+import ctypes as ct
+import math
 import tkinter as tk
 from dataclasses import dataclass, field
 from queue import Empty, SimpleQueue
 from threading import Event, Thread
 from time import monotonic
-from tkinter import ttk
+from tkinter import font as tkfont
 
 from .audit import Audit
 from .core import ApprovalRequest, Brain, Result, normalize, run_command
+from .hotkey import HOTKEY_LABEL, GlobalHotkey, HotkeyUnavailable
 from .tools import LocalTools
 from .tray import SystemTray
 
-BACKGROUND = "#111922"
-PANEL = "#17232f"
-OUTLINE = "#38495c"
-TEXT = "#edf3f8"
-MUTED = "#aebdcc"
-ACCENT = "#a9e578"
-APPROVAL_BACKGROUND = "#2b241b"
-APPROVAL_TEXT = "#ffe0ab"
+# Paleta HUD
+BACKGROUND = "#0a1016"
+SURFACE = "#0f1a23"
+BORDER = "#1c3242"
+DIVIDER = "#16262f"
+TEXT = "#e8f5fc"
+MUTED = "#6c8696"
+CYAN = "#4fd8ff"
+AMBER = "#ffb547"
+GREEN = "#5ee6a0"
+RED = "#ff6b6b"
+APPROVAL_SURFACE = "#1f1a0f"
 FONT = "Segoe UI"
+
+WIDTH = 720
+MAX_OUTPUT_LINES = 16
+PLACEHOLDER = "Pregúntame lo que quieras…"
+
+STATE_COLORS = {
+    "Listo": CYAN,
+    "En ejecución": CYAN,
+    "Cancelando…": AMBER,
+    "Requiere aprobación": AMBER,
+    "Completado": GREEN,
+    "Error": RED,
+    "Detenido": AMBER,
+    "Cancelado": MUTED,
+}
+BUSY_STATES = {"En ejecución", "Cancelando…"}
+RESULT_STATUSES = {0: "Completado", 1: "Error", 2: "Detenido", 130: "Cancelado"}
+
+
+def _mix(color: str, other: str, amount: float) -> str:
+    """Mezcla dos colores #rrggbb; amount=0 devuelve color y 1 devuelve other."""
+    a = [int(color[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(other[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(x + (y - x) * amount):02x}" for x, y in zip(a, b))
 
 
 @dataclass
@@ -61,199 +94,371 @@ def _run_task(
     task.events.put(result)
 
 
+class _Orb:
+    """Orbe animado que refleja el estado de JARVIS."""
+
+    def __init__(self, parent: tk.Widget, size: int):
+        self.size = size
+        self.canvas = tk.Canvas(
+            parent, width=size, height=size, background=SURFACE, highlightthickness=0, bd=0,
+        )
+        self._glows = [self.canvas.create_oval(0, 0, 0, 0, width=0) for _ in range(3)]
+        self._core = self.canvas.create_oval(0, 0, 0, 0, width=0)
+        self._ring = self.canvas.create_oval(0, 0, 0, 0, width=max(1, size // 22))
+        self._spinner = self.canvas.create_arc(
+            0, 0, 0, 0, style="arc", width=max(2, size // 14), start=0, extent=110,
+        )
+        self._phase = 0.0
+
+    def draw(self, state: str, step: float) -> None:
+        self._phase += step
+        color = STATE_COLORS.get(state, CYAN)
+        busy = state in BUSY_STATES
+        speed = 5.0 if busy else 1.6 if state == "Requiere aprobación" else 1.1
+        pulse = (math.sin(self._phase * speed) + 1) / 2
+        center = self.size / 2
+        base = self.size * 0.2
+        radius = base * (1 + 0.12 * pulse)
+        for index, glow in enumerate(self._glows):
+            extent = radius + self.size * (0.08 + 0.07 * index) * (0.7 + 0.3 * pulse)
+            shade = _mix(color, SURFACE, 0.72 + 0.09 * index - 0.1 * pulse)
+            self.canvas.coords(glow, center - extent, center - extent, center + extent, center + extent)
+            self.canvas.itemconfigure(glow, fill=shade)
+        self.canvas.coords(self._core, center - radius, center - radius, center + radius, center + radius)
+        self.canvas.itemconfigure(self._core, fill=_mix(color, "#ffffff", 0.25 * pulse))
+        ring = self.size * 0.42
+        self.canvas.coords(self._ring, center - ring, center - ring, center + ring, center + ring)
+        self.canvas.itemconfigure(self._ring, outline=_mix(color, SURFACE, 0.65))
+        self.canvas.coords(self._spinner, center - ring, center - ring, center + ring, center + ring)
+        self.canvas.itemconfigure(
+            self._spinner, outline=color, state="normal" if busy else "hidden",
+            start=(-self._phase * 240) % 360,
+        )
+
+
 class DesktopWindow:
     def __init__(self, root: tk.Tk, tools: LocalTools, audit: Audit, brain: Brain | None = None):
         self.root = root
         self.tools = tools
         self.audit = audit
         self.brain = brain
+        self.hide_on_blur = False
         self._task: _Task | None = None
         self._approval: _Approval | None = None
         self._tray: SystemTray | None = None
+        self._tray_available = False
+        self._hotkey: GlobalHotkey | None = None
         self._closing = False
+        self._animation_after: str | None = None
+        self._blur_after: str | None = None
+        self._history: list[str] = []
+        self._history_index = 0
+        self._scale = max(1.0, root.winfo_fpixels("1i") / 96)
         self.command = tk.StringVar(root)
         self.status = tk.StringVar(root, value="Listo")
 
         root.title("JARVIS")
-        root.geometry("840x600")
-        root.minsize(620, 460)
-        root.configure(background=BACKGROUND)
-        root.rowconfigure(0, weight=1)
-        root.columnconfigure(0, weight=1)
-        self._configure_styles()
+        root.overrideredirect(True)
+        root.attributes("-topmost", True)
+        root.configure(background=BORDER)
         self._build()
-        root.bind("<Escape>", lambda event: self.cancel())
-        root.protocol("WM_DELETE_WINDOW", self.close)
-        self.entry.focus_set()
+        self._round_corners()
+        self.command.trace_add("write", lambda *args: self._update_placeholder())
+        self.status.trace_add("write", lambda *args: self._update_status_color())
+        root.bind("<Escape>", lambda event: self._escape())
+        root.bind("<FocusOut>", lambda event: self._schedule_blur_check())
+        self._update_status_color()
+        self._fit()
+        self._animate()
 
-    def _configure_styles(self):
-        style = ttk.Style(self.root)
-        style.theme_use("clam")
-        style.configure(
-            "Jarvis.TButton", background=PANEL, foreground=TEXT, bordercolor=OUTLINE,
-            lightcolor=PANEL, darkcolor=PANEL, focuscolor=ACCENT, font=(FONT, 10),
-            padding=(12, 7),
-        )
-        style.map(
-            "Jarvis.TButton",
-            background=[("active", OUTLINE)],
-            foreground=[("disabled", "#768696")],
-        )
-        style.configure(
-            "Accent.Jarvis.TButton", background=ACCENT, foreground="#102010",
-            bordercolor=ACCENT, lightcolor=ACCENT, darkcolor=ACCENT,
-            focuscolor="#102010", font=(FONT, 10, "bold"), padding=(16, 7),
-        )
-        style.map(
-            "Accent.Jarvis.TButton",
-            background=[("disabled", OUTLINE), ("active", "#c3f49d")],
-            foreground=[("disabled", MUTED)],
+    # --- construcción -------------------------------------------------------------------
+
+    def _px(self, value: float) -> int:
+        return round(value * self._scale)
+
+    def _flat_button(self, parent, text, command, *, background=SURFACE, foreground=MUTED,
+                     active=DIVIDER, bold=False):
+        return tk.Button(
+            parent, text=text, command=command, background=background, foreground=foreground,
+            activebackground=active, activeforeground=TEXT, disabledforeground=_mix(MUTED, SURFACE, 0.5),
+            relief="flat", bd=0, highlightthickness=0, cursor="hand2", takefocus=False,
+            font=(FONT, 10, "bold" if bold else "normal"), padx=self._px(12), pady=self._px(5),
         )
 
-    def _build(self):
-        content = tk.Frame(self.root, background=BACKGROUND, padx=26, pady=22)
-        content.grid(sticky="nsew")
-        content.columnconfigure(0, weight=1)
-        content.rowconfigure(3, weight=1)
+    def _build(self) -> None:
+        families = set(tkfont.families(self.root))
+        mono = "Cascadia Mono" if "Cascadia Mono" in families else "Consolas"
+        pad = self._px(14)
 
-        header = tk.Frame(content, background=BACKGROUND)
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 18))
-        tk.Label(
-            header, text="JARVIS", background=BACKGROUND, foreground=TEXT,
-            font=(FONT, 26, "bold"),
-        ).pack(side="left")
-        tk.Label(
-            header, textvariable=self.status, background=PANEL, foreground=ACCENT,
-            font=(FONT, 10, "bold"), padx=11, pady=6,
-        ).pack(side="right")
-        self.hide_button = ttk.Button(
-            header, text="Ocultar", command=self.hide_to_tray, style="Jarvis.TButton", state="disabled",
-        )
-        self.hide_button.pack(side="right", padx=(0, 9))
+        self.frame = tk.Frame(self.root, background=SURFACE)
+        self.frame.pack(fill="both", expand=True, padx=1, pady=1)
+        self.frame.columnconfigure(0, weight=1)
 
-        form = tk.Frame(content, background=BACKGROUND)
-        form.grid(row=1, column=0, sticky="ew", pady=(0, 15))
-        form.columnconfigure(0, weight=1)
-        tk.Label(
-            form, text="Orden", background=BACKGROUND, foreground=TEXT, font=(FONT, 11, "bold"),
-        ).grid(row=0, column=0, sticky="w", pady=(0, 7))
+        bar = tk.Frame(self.frame, background=SURFACE)
+        bar.grid(row=0, column=0, sticky="ew", padx=(pad, pad), pady=(self._px(10), self._px(10)))
+        bar.columnconfigure(1, weight=1)
+        self.orb = _Orb(bar, self._px(44))
+        self.orb.canvas.grid(row=0, column=0, padx=(0, self._px(10)))
+
         self.entry = tk.Entry(
-            form, textvariable=self.command, background=PANEL, foreground=TEXT,
-            disabledbackground=PANEL, disabledforeground=MUTED, insertbackground=TEXT,
-            highlightthickness=1, highlightbackground=OUTLINE, highlightcolor=ACCENT,
-            font=(FONT, 13), relief="flat",
+            bar, textvariable=self.command, background=SURFACE, foreground=TEXT,
+            disabledbackground=SURFACE, disabledforeground=MUTED, insertbackground=CYAN,
+            insertwidth=self._px(2), relief="flat", bd=0, highlightthickness=0,
+            font=(FONT, 16), selectbackground=BORDER, selectforeground=TEXT,
         )
-        self.entry.grid(row=1, column=0, sticky="nsew", ipady=7)
+        self.entry.grid(row=0, column=1, sticky="ew", ipady=self._px(4))
+        self.placeholder = tk.Label(
+            bar, text=PLACEHOLDER, background=SURFACE, foreground=MUTED, font=(FONT, 16), cursor="xterm",
+        )
+        self.placeholder.grid(row=0, column=1, sticky="w")
+        self.placeholder.bind("<Button-1>", lambda event: self.entry.focus_set())
         self.entry.bind("<Return>", lambda event: self.submit())
-        self.execute_button = ttk.Button(
-            form, text="Ejecutar", command=self.submit, style="Accent.Jarvis.TButton",
-        )
-        self.execute_button.grid(row=1, column=1, padx=(9, 0), sticky="ns")
-        self.cancel_button = ttk.Button(
-            form, text="Cancelar", command=self.cancel, style="Jarvis.TButton", state="disabled",
-        )
-        self.cancel_button.grid(row=1, column=2, padx=(7, 0), sticky="ns")
+        self.entry.bind("<Up>", lambda event: self._browse_history(-1))
+        self.entry.bind("<Down>", lambda event: self._browse_history(1))
 
-        shortcuts = tk.Frame(form, background=BACKGROUND)
-        shortcuts.grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
-        self.shortcuts = []
-        for label, command in (
-            ("CPU y RAM", "consulta CPU y RAM"),
-            ("Volumen", "consulta el volumen"),
-            ("Memoria", "qué recuerdas"),
-            ("Ayuda", "ayuda"),
-        ):
-            button = ttk.Button(
-                shortcuts, text=label, command=lambda value=command: self._run_example(value),
-                style="Jarvis.TButton",
-            )
-            button.pack(side="left", padx=(0, 7))
-            self.shortcuts.append(button)
-
-        self.approval_panel = tk.Frame(
-            content, background=APPROVAL_BACKGROUND, padx=13, pady=10,
+        self.status_label = tk.Label(
+            bar, textvariable=self.status, background=SURFACE, font=(FONT, 9, "bold"),
         )
-        self.approval_panel.grid(row=2, column=0, sticky="ew", pady=(0, 14))
+        self.status_label.grid(row=0, column=2, padx=(self._px(10), self._px(4)))
+        self.execute_button = self._flat_button(bar, "⏎", self.submit, foreground=CYAN)
+        self.execute_button.grid(row=0, column=3)
+        self.hide_button = self._flat_button(bar, "—", self.hide_to_tray)
+        self.hide_button.configure(state="disabled")
+        self.hide_button.grid(row=0, column=4)
+
+        self.divider = tk.Frame(self.frame, background=DIVIDER, height=1)
+        self.divider.grid(row=1, column=0, sticky="ew")
+
+        self.approval_panel = tk.Frame(self.frame, background=APPROVAL_SURFACE)
+        self.approval_panel.grid(row=2, column=0, sticky="ew")
+        self.approval_panel.columnconfigure(0, weight=1)
         self.prompt = tk.Label(
-            self.approval_panel, background=APPROVAL_BACKGROUND, foreground=APPROVAL_TEXT,
-            font=(FONT, 11, "bold"), anchor="w", justify="left", wraplength=520,
+            self.approval_panel, background=APPROVAL_SURFACE, foreground=AMBER, font=(FONT, 11, "bold"),
+            anchor="w", justify="left", wraplength=self._px(WIDTH - 260),
         )
-        self.prompt.pack(fill="x", pady=(0, 8))
-        self.approve_button = ttk.Button(
-            self.approval_panel, text="Aprobar", command=lambda: self._answer(True),
-            style="Accent.Jarvis.TButton",
+        self.prompt.grid(row=0, column=0, sticky="ew", padx=(pad, self._px(8)), pady=self._px(10))
+        self.reject_button = self._flat_button(
+            self.approval_panel, "Rechazar", lambda: self._answer(False),
+            background=APPROVAL_SURFACE, foreground=TEXT, active="#2c2516",
         )
-        self.approve_button.pack(side="right")
-        self.reject_button = ttk.Button(
-            self.approval_panel, text="Rechazar", command=lambda: self._answer(False),
-            style="Jarvis.TButton",
+        self.reject_button.grid(row=0, column=1, padx=(0, self._px(6)))
+        self.approve_button = self._flat_button(
+            self.approval_panel, "Aprobar", lambda: self._answer(True),
+            background=AMBER, foreground="#1a1306", active="#ffc977", bold=True,
         )
-        self.reject_button.pack(side="right", padx=(0, 7))
+        self.approve_button.grid(row=0, column=2, padx=(0, pad))
         self.approval_panel.grid_remove()
 
-        results = tk.Frame(content, background=BACKGROUND)
-        results.grid(row=3, column=0, sticky="nsew")
-        results.columnconfigure(0, weight=1)
-        results.rowconfigure(1, weight=1)
-        tk.Label(
-            results, text="Resultado", background=BACKGROUND, foreground=TEXT,
-            font=(FONT, 11, "bold"),
-        ).grid(row=0, column=0, sticky="w", pady=(0, 7))
         self.output = tk.Text(
-            results, background=PANEL, foreground=TEXT, selectbackground=OUTLINE,
-            selectforeground=TEXT, highlightthickness=1, highlightbackground=OUTLINE,
-            highlightcolor=ACCENT, font=("Consolas", 11), wrap="word", padx=13, pady=12,
-            relief="flat", state="disabled",
+            self.frame, background=SURFACE, foreground=TEXT, selectbackground=BORDER,
+            selectforeground=TEXT, relief="flat", bd=0, highlightthickness=0, wrap="word",
+            font=(FONT, 11), padx=pad, pady=self._px(10), height=1, state="disabled",
+            cursor="arrow", spacing1=self._px(2), spacing3=self._px(2),
         )
-        self.output.grid(row=1, column=0, sticky="nsew")
-        scrollbar = ttk.Scrollbar(results, orient="vertical", command=self.output.yview)
-        scrollbar.grid(row=1, column=1, sticky="ns")
-        self.output.configure(yscrollcommand=scrollbar.set)
+        self.output.tag_configure("mono", font=(mono, 10))
+        self.output.grid(row=3, column=0, sticky="nsew")
 
-    def _run_example(self, text: str) -> None:
-        self.command.set(text)
-        self.submit()
+        footer = tk.Frame(self.frame, background=BACKGROUND)
+        footer.grid(row=4, column=0, sticky="ew")
+        footer.columnconfigure(0, weight=1)
+        self.hint = tk.Label(
+            footer, background=BACKGROUND, foreground=MUTED, font=(FONT, 9), anchor="w",
+            text=f"Enter ejecutar · Esc ocultar · ↑↓ historial · {HOTKEY_LABEL} mostrar",
+        )
+        self.hint.grid(row=0, column=0, sticky="ew", padx=pad, pady=self._px(6))
+        self.cancel_button = self._flat_button(
+            footer, "Cancelar", self.cancel, background=BACKGROUND, foreground=AMBER, active=SURFACE,
+        )
+        self.cancel_button.configure(state="disabled")
+        self.cancel_button.grid(row=0, column=1, padx=(0, self._px(8)))
+        self.entry.focus_set()
+
+    def _round_corners(self) -> None:
+        """Esquinas redondeadas nativas de Windows 11; en otras versiones no hace nada."""
+        try:
+            self.root.update_idletasks()
+            user = ct.WinDLL("user32.dll")
+            user.GetAncestor.restype = ct.c_void_p
+            user.GetAncestor.argtypes = [ct.c_void_p, ct.c_uint]
+            window = user.GetAncestor(self.root.winfo_id(), 2)
+            preference = ct.c_int(2)  # DWMWCP_ROUND
+            ct.WinDLL("dwmapi.dll").DwmSetWindowAttribute(
+                ct.c_void_p(window), 33, ct.byref(preference), ct.sizeof(preference),
+            )
+        except (OSError, AttributeError):
+            pass
+
+    # --- presentación -------------------------------------------------------------------
+
+    def _animate(self) -> None:
+        if self._closing:
+            return
+        visible = self.root.state() != "withdrawn"
+        if visible:
+            self.orb.draw(self.status.get(), 0.033 * 2)
+        try:
+            self._animation_after = self.root.after(33 if visible else 400, self._animate)
+        except tk.TclError:
+            self._animation_after = None
+
+    def _update_placeholder(self) -> None:
+        if self.command.get():
+            self.placeholder.grid_remove()
+        else:
+            self.placeholder.grid()
+
+    def _update_status_color(self) -> None:
+        self.status_label.configure(foreground=STATE_COLORS.get(self.status.get(), MUTED))
+
+    def _fit(self) -> None:
+        """Ajusta la altura al contenido y coloca la barra en el tercio superior de la pantalla."""
+        has_output = bool(self.output.get("1.0", "end-1c"))
+        if has_output:
+            # El área debe estar visible y con su ancho real antes de contar líneas ajustadas.
+            self.output.grid()
+            self.root.geometry(f"{self._px(WIDTH)}x{max(self.root.winfo_height(), 1)}")
+            self.root.update_idletasks()
+            counted = self.output.count("1.0", "end", "displaylines")
+            lines = counted[0] if isinstance(counted, tuple) else counted or 1
+            self.output.configure(height=max(1, min(lines, MAX_OUTPUT_LINES)))
+        else:
+            self.output.grid_remove()
+        if has_output or self._approval is not None:
+            self.divider.grid()
+        else:
+            self.divider.grid_remove()
+        self.root.update_idletasks()
+        width = self._px(WIDTH)
+        height = self.frame.winfo_reqheight() + 2
+        x = (self.root.winfo_screenwidth() - width) // 2
+        y = self.root.winfo_screenheight() // 5
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _set_output(self, text: str) -> None:
+        self.output.configure(state="normal")
+        self.output.delete("1.0", "end")
+        self.output.insert("1.0", text, ("mono",) if "\n" in text and "PID" in text else ())
+        self.output.configure(state="disabled")
+        self.output.yview_moveto(0)
+        self._fit()
+
+    def _set_busy(self, busy: bool) -> None:
+        state = "disabled" if busy else "normal"
+        self.entry.configure(state=state)
+        self.execute_button.configure(state=state)
+        self.cancel_button.configure(state="normal" if busy else "disabled")
+
+    # --- mostrar / ocultar --------------------------------------------------------------
+
+    @property
+    def _can_hide(self) -> bool:
+        tray = self._tray is not None and self._tray_available
+        hotkey = self._hotkey is not None and self._hotkey.available
+        return tray or hotkey
 
     def enable_tray(self) -> None:
         try:
             self._tray = SystemTray(self.root, self.show_from_tray, self.close, self._tray_changed)
+            self._tray_available = bool(self._tray.available)
         except OSError:
-            return
-        self.hide_button.configure(state="normal")
+            self._tray = None
+            self._tray_available = False
+        self._refresh_hide_button()
+
+    def enable_hotkey(self) -> bool:
+        try:
+            self._hotkey = GlobalHotkey(self.root, self.toggle)
+        except (OSError, HotkeyUnavailable):
+            self._hotkey = None
+            self.hint.configure(text=f"No pude registrar {HOTKEY_LABEL}: otro programa ya lo usa.")
+        self._refresh_hide_button()
+        return self._hotkey is not None
+
+    def _refresh_hide_button(self) -> None:
+        self.hide_button.configure(state="normal" if self._can_hide else "disabled")
 
     def hide_to_tray(self) -> None:
-        if self._tray is not None and self._tray.available:
+        if self._can_hide and self._approval is None:
             self.root.withdraw()
 
     def show_from_tray(self) -> None:
-        if not self._closing:
-            self.root.deiconify()
-            self.root.lift()
+        if self._closing:
+            return
+        self.root.deiconify()
+        self.root.lift()
+        self._fit()
+        self._focus()
+        if self.brain is not None and hasattr(self.brain, "warm_up"):
+            Thread(target=_warm_up, args=(self.brain,), daemon=True).start()
+
+    def _focus(self) -> None:
+        self.root.attributes("-topmost", True)
+        self.root.focus_force()
+        self.entry.focus_set()
+        self.entry.select_range(0, "end")
+        try:
+            user = ct.WinDLL("user32.dll")
+            user.GetAncestor.restype = ct.c_void_p
+            user.GetAncestor.argtypes = [ct.c_void_p, ct.c_uint]
+            user.SetForegroundWindow.argtypes = [ct.c_void_p]
+            user.SetForegroundWindow(user.GetAncestor(self.root.winfo_id(), 2))
+        except (OSError, AttributeError):
+            pass
+
+    def toggle(self) -> None:
+        visible = self.root.state() != "withdrawn"
+        if visible and self.root.focus_get() is not None:
+            self.hide_to_tray()
+        else:
+            self.show_from_tray()
+
+    def _schedule_blur_check(self) -> None:
+        if self.hide_on_blur and not self._closing and self._blur_after is None:
+            self._blur_after = self.root.after(150, self._hide_if_blurred)
+
+    def _hide_if_blurred(self) -> None:
+        self._blur_after = None
+        if not self.hide_on_blur or self._closing or self._task is not None:
+            return
+        try:
+            focused = self.root.focus_get()
+        except (KeyError, tk.TclError):
+            focused = None
+        if focused is None:
+            self.hide_to_tray()
 
     def _tray_changed(self, available: bool) -> None:
-        self.hide_button.configure(state="normal" if available else "disabled")
-        if not available and not self._closing and self.root.state() == "withdrawn":
+        self._tray_available = available
+        self._refresh_hide_button()
+        if not self._can_hide and not self._closing and self.root.state() == "withdrawn":
             self.root.deiconify()
 
     def release_tray(self) -> None:
         if self._tray is not None:
             self._tray.close()
             self._tray = None
+        if self._hotkey is not None:
+            self._hotkey.close()
+            self._hotkey = None
 
-    def _set_output(self, text: str) -> None:
-        self.output.configure(state="normal")
-        self.output.delete("1.0", "end")
-        self.output.insert("1.0", text)
-        self.output.configure(state="disabled")
-        self.output.yview_moveto(0)
+    def _escape(self) -> None:
+        if self._approval is not None:
+            self._answer(False)
+        elif self._task is not None:
+            self.cancel()
+        else:
+            self.hide_to_tray()
 
-    def _set_busy(self, busy: bool) -> None:
-        state = "disabled" if busy else "normal"
-        self.entry.configure(state=state)
-        self.execute_button.configure(state=state)
-        for button in self.shortcuts:
-            button.configure(state=state)
-        self.cancel_button.configure(state="normal" if busy else "disabled")
+    def _browse_history(self, direction: int) -> str:
+        if not self._history:
+            return "break"
+        self._history_index = max(0, min(len(self._history), self._history_index + direction))
+        value = self._history[self._history_index] if self._history_index < len(self._history) else ""
+        self.command.set(value)
+        self.entry.icursor("end")
+        return "break"
+
+    # --- tareas -------------------------------------------------------------------------
 
     def submit(self) -> None:
         text = self.command.get().strip()
@@ -262,6 +467,9 @@ class DesktopWindow:
         if normalize(text) == "salir":
             self.close()
             return
+        if not self._history or self._history[-1] != text:
+            self._history.append(text)
+        self._history_index = len(self._history)
         task = _Task()
         self._task = task
         self._set_busy(True)
@@ -286,19 +494,26 @@ class DesktopWindow:
                     self._finish(event)
                     return
                 if not task.cancelled.is_set():
-                    self._approval = event
-                    request = event.request
-                    step = f"Paso {request.step_index}. " if request.step_index is not None else ""
-                    self.prompt.configure(text=f"{step}{request.summary} ({request.timeout_seconds} s)")
-                    self.approval_panel.grid()
-                    self.status.set("Requiere aprobación")
-                    self.reject_button.focus_set()
+                    self._show_approval(event)
         except Empty:
             self.root.after(25, self._poll)
+
+    def _show_approval(self, approval: _Approval) -> None:
+        self._approval = approval
+        request = approval.request
+        step = f"Paso {request.step_index}. " if request.step_index is not None else ""
+        self.prompt.configure(text=f"{step}{request.summary} ({request.timeout_seconds} s)")
+        self.approval_panel.grid()
+        self.status.set("Requiere aprobación")
+        if self.root.state() == "withdrawn":
+            self.show_from_tray()
+        self._fit()
+        self.reject_button.focus_set()
 
     def _hide_approval(self) -> None:
         self._approval = None
         self.approval_panel.grid_remove()
+        self._fit()
 
     def _answer(self, accepted: bool) -> None:
         approval = self._approval
@@ -323,20 +538,29 @@ class DesktopWindow:
         self._task = None
         self._hide_approval()
         if self._closing:
-            self.release_tray()
-            self.root.destroy()
+            self._destroy()
             return
-        self._set_output(result.message)
-        statuses = {0: "Completado", 1: "Error", 2: "Detenido", 130: "Cancelado"}
-        self.status.set(statuses.get(result.code, "Detenido"))
+        self.status.set(RESULT_STATUSES.get(result.code, "Detenido"))
         self._set_busy(False)
+        self.command.set("")
+        self._set_output(result.message)
         self.entry.focus_set()
+
+    def _destroy(self) -> None:
+        for after_id in (self._animation_after, self._blur_after):
+            if after_id is not None:
+                try:
+                    self.root.after_cancel(after_id)
+                except tk.TclError:
+                    pass
+        self._animation_after = self._blur_after = None
+        self.release_tray()
+        self.root.destroy()
 
     def close(self) -> None:
         self._closing = True
         if self._task is None:
-            self.release_tray()
-            self.root.destroy()
+            self._destroy()
         else:
             self.cancel()
 
@@ -348,16 +572,30 @@ def _warm_up(brain) -> None:
         pass  # La primera orden libre volverá a intentarlo.
 
 
-def run_window(tools: LocalTools, audit: Audit, brain=None) -> int:
+def _enable_dpi_awareness() -> None:
+    try:
+        ct.WinDLL("shcore.dll").SetProcessDpiAwareness(1)
+    except (OSError, AttributeError):
+        pass
+
+
+def run_window(tools: LocalTools, audit: Audit, brain=None, *, start_hidden: bool = False) -> int:
+    _enable_dpi_awareness()
     try:
         root = tk.Tk()
     except tk.TclError:
         print("No se pudo abrir la ventana de JARVIS.")
         return 1
+    root.withdraw()
     window = DesktopWindow(root, tools, audit, brain)
+    window.hide_on_blur = True
     window.enable_tray()
-    if brain is not None and hasattr(brain, "warm_up"):
-        Thread(target=_warm_up, args=(brain,), daemon=True).start()
+    window.enable_hotkey()
+    if start_hidden and window._can_hide:
+        if brain is not None and hasattr(brain, "warm_up"):
+            Thread(target=_warm_up, args=(brain,), daemon=True).start()
+    else:
+        window.show_from_tray()
     try:
         root.mainloop()
     finally:

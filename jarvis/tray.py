@@ -35,6 +35,9 @@ MF_STRING = 0
 TPM_RIGHTBUTTON = 0x0002
 TPM_NONOTIFY = 0x0080
 TPM_RETURNCMD = 0x0100
+# Los mensajes nativos se anotan y la ventana los atiende en su propio ciclo. Llamar a
+# Tkinter dentro del callback de Windows, mientras Tcl tiene el GIL liberado, cierra Python.
+POLL_MS = 50
 
 
 class NotifyIconData(ct.Structure):
@@ -80,6 +83,8 @@ class SystemTray:
         self._attached = False
         self._version4 = False
         self._menu_open = False
+        self._pending: list = []
+        self._poll_after = None
 
         user = ct.WinDLL("user32.dll")
         shell = ct.WinDLL("shell32.dll")
@@ -129,6 +134,7 @@ class SystemTray:
         if not self._register():
             self.close()
             raise OSError("Windows no pudo mostrar el icono de JARVIS.")
+        self._poll()
 
     def _register(self) -> bool:
         self.available = bool(self._notify(NIM_ADD, ct.byref(self._data)))
@@ -148,15 +154,15 @@ class SystemTray:
         if message == WM_NCDESTROY:
             self.close()
         elif message == self._taskbar_created:
-            self.root.after_idle(self._restore_icon)
+            self._queue(self._restore_icon)
         elif message == TRAY_MESSAGE:
             code = lparam & 0xFFFF
             icon_id = (lparam >> 16) & 0xFFFF if self._version4 else wparam
             if icon_id == TRAY_ICON_ID and self.available:
                 if code in (WM_LBUTTONUP, NIN_SELECT, NIN_KEYSELECT):
-                    self.root.after_idle(self._show)
+                    self._queue(self._show)
                 elif code == (WM_CONTEXTMENU if self._version4 else WM_RBUTTONUP):
-                    self.root.after_idle(self._context_menu)
+                    self._queue(self._context_menu)
             return 0
         return self._default_proc(window, message, wparam, lparam)
 
@@ -197,7 +203,29 @@ class SystemTray:
         elif self.available:
             self._notify(NIM_SETFOCUS, ct.byref(self._data))
 
+    def _queue(self, action) -> None:
+        if action not in self._pending:
+            self._pending.append(action)
+
+    def _poll(self) -> None:
+        if not self._attached:
+            return
+        actions, self._pending = self._pending, []
+        for action in actions:
+            action()
+        if self._attached:
+            try:
+                self._poll_after = self.root.after(POLL_MS, self._poll)
+            except Exception:
+                self._poll_after = None
+
     def close(self) -> None:
+        if self._poll_after is not None:
+            try:
+                self.root.after_cancel(self._poll_after)
+            except Exception:
+                pass
+            self._poll_after = None
         if self.available:
             self.available = False
             self._notify(NIM_DELETE, ct.byref(self._data))

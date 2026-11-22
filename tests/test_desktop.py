@@ -143,6 +143,37 @@ class DesktopTests(unittest.TestCase):
         tray.close.assert_called_once_with()
         destroy.assert_called_once_with()
 
+    def test_escape_rejects_a_pending_approval_and_history_recalls_orders(self):
+        self.window.command.set("pon el volumen al 35 %")
+        self.window.execute_button.invoke()
+        self.wait_until(lambda: self.window.status.get() == "Requiere aprobación")
+        self.window._escape()
+        self.wait_until(lambda: self.window.status.get() == "Detenido")
+        self.tools.set_volume.assert_not_called()
+        self.assertEqual(self.window.command.get(), "")
+        self.window._browse_history(-1)
+        self.assertEqual(self.window.command.get(), "pon el volumen al 35 %")
+        self.window._browse_history(1)
+        self.assertEqual(self.window.command.get(), "")
+
+    def test_hotkey_toggles_the_bar_and_allows_hiding_without_tray(self):
+        hotkey = Mock(available=True)
+        with patch("jarvis.desktop.GlobalHotkey", return_value=hotkey) as install:
+            self.assertTrue(self.window.enable_hotkey())
+        toggle = install.call_args.args[1]
+        self.assertEqual(str(self.window.hide_button["state"]), "normal")
+        with patch.object(self.root, "deiconify") as show:
+            toggle()
+        show.assert_called_once_with()
+        self.window.release_tray()
+        hotkey.close.assert_called_once_with()
+
+    def test_busy_hotkey_reports_the_conflict(self):
+        with patch("jarvis.desktop.GlobalHotkey", side_effect=OSError):
+            self.assertFalse(self.window.enable_hotkey())
+        self.assertIn("otro programa ya lo usa", self.window.hint["text"])
+        self.assertEqual(str(self.window.hide_button["state"]), "disabled")
+
     def test_window_stays_usable_when_the_tray_is_unavailable(self):
         with patch("jarvis.desktop.SystemTray", side_effect=OSError) as install:
             self.window.enable_tray()
