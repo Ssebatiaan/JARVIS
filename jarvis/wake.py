@@ -22,7 +22,10 @@ CHUNK = 1280  # 80 ms
 MEL_CONTEXT = 160 * 3
 MEL_WINDOW = 76
 EMBEDDING_FRAMES = 16
-THRESHOLD = 0.5
+# Calibrado con la voz del usuario: sus «Hey Jarvis» marcaron entre 0,28 y 0,99 y las frases
+# normales 0,000. Con 0,5 solo se detectaban 3 de 6; con 0,22 se detectan todos.
+SENSITIVITY = {"alta": 0.15, "normal": 0.22, "baja": 0.35}
+THRESHOLD = SENSITIVITY["normal"]
 REFRACTORY_SECONDS = 2.0
 WARMUP_PREDICTIONS = 5
 MODEL_URL = "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/{}"
@@ -146,7 +149,7 @@ class WakeWordListener:
         self._on_wake = on_wake
         self._model_factory = model_factory
         self._chunks = chunks
-        self._threshold = threshold
+        self.threshold = threshold
         self._stop = threading.Event()
         self._paused = threading.Event()
         self._thread: threading.Thread | None = None
@@ -190,7 +193,7 @@ class WakeWordListener:
                 for chunk in self._chunks(self._stop):
                     if self._paused.is_set():
                         break  # suelta el micrófono mientras JARVIS lo usa
-                    if model.score(chunk) >= self._threshold and monotonic() - last_wake >= REFRACTORY_SECONDS:
+                    if model.score(chunk) >= self.threshold and monotonic() - last_wake >= REFRACTORY_SECONDS:
                         last_wake = monotonic()
                         model.reset()
                         self._on_wake()

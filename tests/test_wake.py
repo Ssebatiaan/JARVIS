@@ -217,6 +217,17 @@ class DesktopWakeTests(unittest.TestCase):
         self.assertEqual(self.preferences["voz.activacion"], "1")
         self.assertEqual(len(FakeListener.instances), 2)
 
+    def test_sensitivity_can_be_changed_by_voice_and_is_remembered(self):
+        self.window.enable_wake_word(Path("."))
+        listener = FakeListener.instances[0]
+        self.assertEqual(listener.threshold, 0.22)
+        self.window.command.set("Sensibilidad alta")
+        self.window.submit()
+        self.assertEqual((listener.threshold, self.preferences["voz.sensibilidad"]), (0.15, "alta"))
+        self.window.disable_wake_word()
+        self.window.enable_wake_word(Path("."))
+        self.assertEqual(FakeListener.instances[-1].threshold, 0.15)
+
     def test_stays_off_when_disabled_or_without_voice(self):
         self.preferences["voz.activacion"] = "0"
         self.window.enable_wake_word(Path("."))

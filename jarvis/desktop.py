@@ -38,6 +38,11 @@ ICON_SEND, ICON_MIC, ICON_STOP = "\ue724", "\ue720", "\ue71a"
 ICON_VOLUME, ICON_MUTE, ICON_HIDE = "\ue767", "\ue74f", "\ue921"
 SPEECH_SETTING = "voz.respuestas"
 WAKE_SETTING = "voz.activacion"
+SENSITIVITY_SETTING = "voz.sensibilidad"
+SENSITIVITY_COMMANDS = {
+    "sensibilidad alta": "alta", "sube la sensibilidad": "alta", "sensibilidad normal": "normal",
+    "sensibilidad baja": "baja", "baja la sensibilidad": "baja",
+}
 WAKE_COMMANDS = {
     "activa hey jarvis": True, "activa la palabra de activacion": True, "escuchame siempre": True,
     "desactiva hey jarvis": False, "desactiva la palabra de activacion": False,
@@ -670,9 +675,11 @@ class DesktopWindow:
         if self.preferences is not None and self.preferences.get_setting(WAKE_SETTING, "1") != "1":
             self._refresh_hint()
             return
-        from .wake import WakeWordListener
+        from .wake import SENSITIVITY, WakeWordListener
 
+        level = self.preferences.get_setting(SENSITIVITY_SETTING, "normal") if self.preferences else "normal"
         self._wake = WakeWordListener(folder, self._wake_heard.set)
+        self._wake.threshold = SENSITIVITY.get(level, SENSITIVITY["normal"])
         self._wake.start()
         self._refresh_hint()
         self._wake_after = self.root.after(100, self._poll_wake)
@@ -699,6 +706,18 @@ class DesktopWindow:
             return "Como desee, señor. Le escucharé cuando diga «Hey Jarvis»."
         self.disable_wake_word()
         return "Entendido, señor. Dejo de escuchar «Hey Jarvis»; puede llamarme con AltGr+K."
+
+    def _set_sensitivity(self, level: str) -> str:
+        from .wake import SENSITIVITY
+
+        if self.preferences is not None:
+            self.preferences.set_setting(SENSITIVITY_SETTING, level)
+        if self._wake is not None:
+            self._wake.threshold = SENSITIVITY[level]
+        hint = {"alta": "le oiré con más facilidad, aunque podría activarme alguna vez sin motivo",
+                "normal": "vuelvo a la sensibilidad calibrada con su voz",
+                "baja": "solo me activaré si lo dice con claridad"}[level]
+        return f"Muy bien, señor: sensibilidad {level}; {hint}."
 
     def _poll_wake(self) -> None:
         self._wake_after = None
@@ -729,10 +748,12 @@ class DesktopWindow:
         if normalize(text) == "salir":
             self.close()
             return
-        toggle = WAKE_COMMANDS.get(normalize(text).strip(" .¿?¡!"))
-        if toggle is not None:
+        spoken = normalize(text).strip(" .¿?¡!")
+        toggle = WAKE_COMMANDS.get(spoken)
+        level = SENSITIVITY_COMMANDS.get(spoken)
+        if toggle is not None or level is not None:
             self.command.set("")
-            message = self._set_wake_word(toggle)
+            message = self._set_wake_word(toggle) if toggle is not None else self._set_sensitivity(level)
             self.status.set("Completado")
             self._set_output(message)
             if self.speak_enabled and self.voice is not None:
