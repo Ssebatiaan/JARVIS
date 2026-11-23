@@ -23,7 +23,7 @@ VOCABULARY = (
 )
 VOICE = "es-MX-JorgeNeural"
 # Velocidad de la voz (el usuario la encontraba muy pausada a -6 %). Se cambia con la voz.
-SPEEDS = {"lenta": "-5%", "normal": "+10%", "rápida": "+20%", "muy rápida": "+30%"}
+SPEEDS = {"lenta": "+5%", "normal": "+25%", "rápida": "+35%", "muy rápida": "+45%"}
 SPEED_ORDER = ("lenta", "normal", "rápida", "muy rápida")
 DEFAULT_SPEED = "normal"
 _current_rate = [SPEEDS[DEFAULT_SPEED]]

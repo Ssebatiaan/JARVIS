@@ -127,6 +127,8 @@ class _Listen:
     events: SimpleQueue = field(default_factory=SimpleQueue)
     cancelled: bool = False
     level: float = 0.0
+    on_text: object = None  # si existe, recibe lo oído en lugar de ejecutarlo como orden
+    quiet: bool = False     # si no se oye nada, no muestra aviso (escucha de seguimiento)
 
     def set_level(self, level: float) -> None:
         self.level = level
@@ -268,6 +270,7 @@ class DesktopWindow:
         self._listen_hotkey: GlobalHotkey | None = None
         self._greeted = False
         self._dismiss_deadline = 0.0
+        self._confirm_attempts = 0
         self._wake = None
         self._wake_folder = None
         self.floating_orb = None  # orbe flotante (jarvis/orb.py), si Pillow está disponible
@@ -701,24 +704,30 @@ class DesktopWindow:
             self.show_from_tray()
         self.start_listening()
 
-    def start_listening(self) -> None:
-        """Empieza a escuchar; si ya escucha, termina la grabación y transcribe lo dicho."""
+    def start_listening(self, *, on_text=None, quiet: bool = False) -> None:
+        """Empieza a escuchar; si ya escucha, termina la grabación y transcribe lo dicho.
+
+        ``on_text`` recibe lo oído en vez de ejecutarlo (respuestas sí/no durante una aprobación);
+        ``quiet`` no avisa si no se oyó nada (cuando JARVIS espera una respuesta tras preguntar).
+        """
         if self.voice is None:
             self._set_output("La voz no está instalada. Abre JARVIS con el entorno .venv del proyecto.")
             return
         if self._listen is not None:
             self._listen.stop.set()
             return
-        if self._task is not None or self._closing:
+        if self._closing or (self._task is not None and on_text is None):
             return
-        listen = _Listen()
+        listen = _Listen(on_text=on_text, quiet=quiet)
         self._listen = listen
         if self._wake is not None:
             self._wake.pause()  # el micrófono queda para la orden
         self.voice.stop_speaking()
         self._warm_voice()
-        self.command.set("")
-        self._set_output("")
+        if on_text is None:
+            self.command.set("")
+            if not quiet:
+                self._set_output("")
         self.entry.configure(state="disabled")
         self.execute_button.configure(state="disabled")
         self.mic_button.configure(text=ICON_STOP, foreground=LISTEN)
@@ -751,8 +760,14 @@ class DesktopWindow:
             self._wake.resume()
         self.orb.level = 0.0
         self.mic_button.configure(text=ICON_MIC, foreground=CYAN)
-        self._set_busy(False)
+        self._set_busy(self._task is not None)
         if self._closing:
+            return
+        if listen.on_text is not None:
+            listen.on_text(None if listen.cancelled or kind == "error" else value)
+            return
+        if listen.quiet and (listen.cancelled or kind == "error" or not value):
+            self.status.set("Listo")
             return
         if listen.cancelled:
             self.status.set("Listo")
@@ -1037,6 +1052,32 @@ class DesktopWindow:
             self.show_from_tray()
         self._fit()
         self.reject_button.focus_set()
+        if self.speak_enabled and self.voice is not None:
+            # La pregunta también se dice en voz alta y se puede responder «sí» o «no» hablando.
+            self.voice.say(f"{request.summary} ¿Lo confirma, señor?")
+            self._confirm_attempts = 0
+            self._after_speech(lambda: self._listen_for_confirmation(approval))
+
+    def _listen_for_confirmation(self, approval: _Approval) -> None:
+        if self._approval is not approval or self._closing:
+            return
+        _wake_chime()
+        self.start_listening(on_text=lambda heard: self._confirmation_heard(approval, heard), quiet=True)
+
+    def _confirmation_heard(self, approval: _Approval, heard) -> None:
+        if self._approval is not approval:
+            return
+        from .text import confirmation
+
+        self.status.set("Requiere aprobación")
+        answer = confirmation(heard)
+        if answer is not None:
+            self._answer(answer)
+            return
+        self._confirm_attempts += 1
+        if heard and self._confirm_attempts < 2:
+            self.voice.say("Disculpe, señor, ¿sí o no?")
+            self._after_speech(lambda: self._listen_for_confirmation(approval))
 
     def _hide_approval(self) -> None:
         self._approval = None
@@ -1079,6 +1120,20 @@ class DesktopWindow:
         if callable(take_dismiss) and take_dismiss() is True:
             self._dismiss_deadline = monotonic() + DISMISS_MAX_WAIT
             self.root.after(400, self._finish_dismiss)
+        elif self.speak_enabled and self.voice is not None and _asks_something(result.message):
+            # JARVIS preguntó algo: abre el micrófono al terminar de hablar, sin «Hey Jarvis».
+            self._after_speech(lambda: (_wake_chime(), self.start_listening(quiet=True)))
+
+    def _after_speech(self, action, deadline: float | None = None) -> None:
+        """Ejecuta ``action`` cuando JARVIS termina de hablar (o tras 20 s como máximo)."""
+        deadline = deadline or monotonic() + 20
+        if self._closing:
+            return
+        if self.voice is not None and getattr(self.voice, "speaking", False) and monotonic() < deadline:
+            self.root.after(150, lambda: self._after_speech(action, deadline))
+            return
+        if self._listen is None and self._enrollment is None:
+            action()
 
     def _finish_dismiss(self) -> None:
         """Espera a que JARVIS termine la despedida y oculta el orbe y el chat."""
@@ -1123,6 +1178,12 @@ class DesktopWindow:
 
 
 DEFAULT_VOICE_SPEED = "normal"
+
+
+def _asks_something(message: str) -> bool:
+    """¿La respuesta termina con una pregunta al usuario?"""
+    lines = [line.strip() for line in (message or "").splitlines() if line.strip()]
+    return bool(lines) and lines[-1].rstrip(" »\"'").endswith("?")
 
 
 def _apply_speed(name: str) -> str:

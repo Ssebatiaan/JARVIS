@@ -341,13 +341,139 @@ class VoiceSpeedTests(unittest.TestCase):
     def test_faster_slower_and_named_levels_change_the_real_rate_and_are_remembered(self):
         from jarvis.voice import voice_rate
 
-        self.assertEqual(voice_rate(), "+10%")
+        self.assertEqual(voice_rate(), "+25%")
         self.assertIn("velocidad rápida", self.say("Jarvis, habla más rápido"))
-        self.assertEqual((voice_rate(), self.preferences.values["voz.velocidad"]), ("+20%", "rápida"))
+        self.assertEqual((voice_rate(), self.preferences.values["voz.velocidad"]), ("+35%", "rápida"))
         self.say("velocidad muy rápida")
         self.assertIn("tan rápido como puedo", self.say("habla más rápido"))
         self.say("habla más despacio")
-        self.assertEqual(voice_rate(), "+20%")
+        self.assertEqual(voice_rate(), "+35%")
         self.say("velocidad lenta")
-        self.assertEqual(voice_rate(), "-5%")
+        self.assertEqual(voice_rate(), "+5%")
         self.assertEqual(self.voice.said[-1], "Entendido, señor. Hablaré a velocidad lenta.")
+
+
+class ConfirmationWordsTests(unittest.TestCase):
+    def test_yes_no_and_unclear(self):
+        from jarvis.text import confirmation
+
+        for text in ("Sí", "sí, adelante", "claro que sí, Jarvis", "dale", "hazlo por favor", "de acuerdo",
+                     "por supuesto"):
+            self.assertIs(confirmation(text), True, text)
+        for text in ("No", "no, mejor no", "Cancela", "mejor no", "eh... no sé"):
+            self.assertIs(confirmation(text), False, text)
+        for text in ("qué hora es", "", None):
+            self.assertIsNone(confirmation(text), text)
+
+
+class ScriptedVoice(FakeVoice):
+    """Voz falsa que habla durante unos ciclos y luego «oye» las respuestas indicadas."""
+
+    def __init__(self, answers):
+        super().__init__(None)
+        self.answers = list(answers)
+        self.listens = 0
+        self._speaking_polls = 0
+
+    @property
+    def speaking(self):
+        if self._speaking_polls > 0:
+            self._speaking_polls -= 1
+            return True
+        return False
+
+    @speaking.setter
+    def speaking(self, value):
+        pass
+
+    def say(self, text):
+        self.said.append(text)
+        self._speaking_polls = 3
+
+    def listen(self, stop, *, on_level=None, on_transcribing=None):
+        self.listens += 1
+        return self.answers.pop(0) if self.answers else None
+
+
+@unittest.skipUnless(os.name == "nt" and tk is not None, "Requiere Windows con Tkinter")
+class FollowUpTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        try:
+            self.root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest(f"Sesión gráfica no disponible: {error}")
+        self.root.withdraw()
+        self.addCleanup(release_tk, self)
+        self.tools = Mock(spec=LocalTools)
+        self.audit = Audit(Path(temporary.name) / "a.sqlite3")
+        chime = unittest.mock.patch("jarvis.desktop._wake_chime")
+        chime.start()
+        self.addCleanup(chime.stop)
+
+    def make(self, answers, brain=None):
+        self.voice = ScriptedVoice(answers)
+        self.window = DesktopWindow(self.root, self.tools, self.audit, brain, self.voice, FakePreferences())
+        self.addCleanup(self.close)
+        return self.window
+
+    def close(self):
+        try:
+            self.window.close()
+        except (AttributeError, tk.TclError):
+            pass
+
+    def wait_until(self, condition, seconds=4):
+        deadline = monotonic() + seconds
+        while not condition():
+            self.root.update()
+            if monotonic() >= deadline:
+                self.fail("La ventana no alcanzó el estado esperado.")
+            sleep(0.01)
+
+    def test_after_a_question_it_listens_for_the_answer_without_wake_word(self):
+        from jarvis.brain import Decision
+
+        brain = Mock()
+        brain.decide.side_effect = [Decision(None, {}, "¿Desea que abra Netflix, señor?"),
+                                    Decision("web.open", {"site": "netflix"}, "Enseguida, señor.")]
+        window = self.make(["sí, por favor"], brain)
+        window.command.set("estoy aburrido")
+        window.submit()
+        self.wait_until(lambda: self.tools.open_url.called)
+        self.assertEqual(brain.decide.call_args_list[1].args[0], "sí, por favor")
+        self.assertEqual(self.voice.listens, 1)
+
+    def test_silence_after_a_question_closes_the_microphone_quietly(self):
+        from jarvis.brain import Decision
+
+        brain = Mock()
+        brain.decide.return_value = Decision(None, {}, "¿Algo más, señor?")
+        window = self.make([], brain)
+        window.command.set("hola")
+        window.submit()
+        self.wait_until(lambda: self.voice.listens == 1 and window._listen is None)
+        self.assertEqual(window.status.get(), "Listo")
+        self.assertIn("¿Algo más, señor?", window.output.get("1.0", "end"))
+
+    def test_approvals_can_be_answered_by_voice(self):
+        from jarvis.tools import VolumeStatus
+
+        self.tools.set_volume.return_value = VolumeStatus(50, False)
+        window = self.make(["sí, adelante"])
+        window.command.set("pon el volumen al 50 %")
+        window.submit()
+        self.wait_until(lambda: self.tools.set_volume.called)
+        self.assertIn("¿Lo confirma, señor?", self.voice.said[0])
+        self.wait_until(lambda: window._task is None)
+        self.assertEqual(window.status.get(), "Completado")
+
+    def test_a_spoken_no_rejects_and_unclear_answers_are_asked_again(self):
+        window = self.make(["qué hora es", "no, mejor no"])
+        window.command.set("pon el volumen al 50 %")
+        window.submit()
+        self.wait_until(lambda: window._task is None, seconds=6)
+        self.tools.set_volume.assert_not_called()
+        self.assertIn("Disculpe, señor, ¿sí o no?", self.voice.said)
+        self.assertEqual(window.status.get(), "Detenido")
