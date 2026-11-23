@@ -5,3 +5,5 @@ faster-whisper==1.2.1
 av>=11,<19
 sounddevice==0.5.6
 edge-tts==7.3.1
+# Orbe flotante con transparencia real (sin Pillow JARVIS usa solo la barra).
+pillow==13.0.0

@@ -3,6 +3,7 @@
 import ctypes as ct
 import math
 import tkinter as tk
+from pathlib import Path
 from dataclasses import dataclass, field
 from queue import Empty, SimpleQueue
 from threading import Event, Thread
@@ -259,6 +260,8 @@ class DesktopWindow:
         self._greeted = False
         self._wake = None
         self._wake_folder = None
+        self.floating_orb = None  # orbe flotante (jarvis/orb.py), si Pillow está disponible
+        self.anchor = None  # función (ancho, alto) -> (x, y) para colocar la barra junto al orbe
         self._enrollment: _Enrollment | None = None
         from . import wake as wake_module
 
@@ -472,8 +475,11 @@ class DesktopWindow:
         self.root.update_idletasks()
         width = self._px(WIDTH)
         height = self.frame.winfo_reqheight() + 2
-        x = (self.root.winfo_screenwidth() - width) // 2
-        y = self.root.winfo_screenheight() // 5
+        if self.anchor is not None:
+            x, y = self.anchor(width, height)
+        else:
+            x = (self.root.winfo_screenwidth() - width) // 2
+            y = self.root.winfo_screenheight() // 5
         self.root.geometry(f"{width}x{height}+{x}+{y}")
 
     def _set_output(self, text: str) -> None:
@@ -496,11 +502,11 @@ class DesktopWindow:
     def _can_hide(self) -> bool:
         tray = self._tray is not None and self._tray_available
         hotkey = self._hotkey is not None and self._hotkey.available
-        return tray or hotkey
+        return tray or hotkey or self.floating_orb is not None
 
-    def enable_tray(self) -> None:
+    def enable_tray(self, icon_path: str | None = None) -> None:
         try:
-            self._tray = SystemTray(self.root, self.show_from_tray, self.close, self._tray_changed)
+            self._tray = SystemTray(self.root, self.show_from_tray, self.close, self._tray_changed, icon_path)
             self._tray_available = bool(self._tray.available)
         except OSError:
             self._tray = None
@@ -533,7 +539,18 @@ class DesktopWindow:
         if self._can_hide and self._approval is None:
             self.root.withdraw()
 
+    def run_quick(self, text: str) -> None:
+        """Ejecuta una orden desde el menú del orbe mostrando la barra con el resultado."""
+        if self._task is not None or self._listen is not None:
+            return
+        if self.root.state() == "withdrawn":
+            self.show_from_tray()
+        self.command.set(text)
+        self.submit()
+
     def show_from_tray(self) -> None:
+        if self.floating_orb is not None:
+            self.floating_orb.show()
         if self._closing:
             return
         self.root.deiconify()
@@ -631,7 +648,8 @@ class DesktopWindow:
             return
         self._greeted = True
         message = welcome()
-        self._set_output(message)
+        if self.root.state() != "withdrawn":
+            self._set_output(message)
         if self.speak_enabled and self.voice is not None:
             self.voice.say(message)
 
@@ -1018,6 +1036,9 @@ class DesktopWindow:
             self.voice.say(result.message)
 
     def _destroy(self) -> None:
+        if self.floating_orb is not None:
+            self.floating_orb.close()
+            self.floating_orb = None
         if self._enrollment is not None:
             self._enrollment.cancelled.set()
         self.disable_wake_word()
@@ -1066,6 +1087,36 @@ def _enable_dpi_awareness() -> None:
         pass
 
 
+def _create_orb(root, window, preferences, voice):
+    """El orbe necesita Pillow; sin él, JARVIS usa solo la barra."""
+    try:
+        from .orb import OrbWindow
+    except ImportError:
+        return None
+    try:
+        return OrbWindow(root, window, preferences, voice)
+    except (OSError, tk.TclError):
+        return None
+
+
+def _tray_icon(folder) -> str | None:
+    """Icono de la bandeja con el emblema de JARVIS (se genera una vez)."""
+    if folder is None:
+        return None
+    try:
+        from .orb_render import OrbRenderer
+    except ImportError:
+        return None
+    path = Path(folder) / "jarvis.ico"
+    if not path.exists():
+        try:
+            Path(folder).mkdir(parents=True, exist_ok=True)
+            OrbRenderer(128).render("reposo", 0.9).save(path, sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64)])
+        except OSError:
+            return None
+    return str(path)
+
+
 def run_window(tools: LocalTools, audit: Audit, brain=None, *, start_hidden: bool = False,
                voice=None, preferences=None, wake_folder=None) -> int:
     _enable_dpi_awareness()
@@ -1077,10 +1128,20 @@ def run_window(tools: LocalTools, audit: Audit, brain=None, *, start_hidden: boo
     root.withdraw()
     window = DesktopWindow(root, tools, audit, brain, voice, preferences)
     window.hide_on_blur = True
-    window.enable_tray()
+    data_folder = Path(wake_folder).parent if wake_folder is not None else None
+    window.enable_tray(_tray_icon(data_folder))
     window.enable_hotkey()
     window.enable_wake_word(wake_folder)
-    if start_hidden and window._can_hide:
+    window.floating_orb = _create_orb(root, window, preferences, voice)
+    if window.floating_orb is not None:
+        window.anchor = window.floating_orb.chat_position
+        if start_hidden:
+            window.floating_orb.hide()
+        else:
+            window.greet()  # el orbe saluda por voz; la barra se abre con un clic
+        if brain is not None and hasattr(brain, "warm_up"):
+            Thread(target=_warm_up, args=(brain,), daemon=True).start()
+    elif start_hidden and window._can_hide:
         if brain is not None and hasattr(brain, "warm_up"):
             Thread(target=_warm_up, args=(brain,), daemon=True).start()
     else:

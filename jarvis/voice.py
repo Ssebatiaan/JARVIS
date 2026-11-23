@@ -416,8 +416,13 @@ class OneShotNeural:
         yield from decoder.flush()
 
 
+# Volumen (RMS) de lo que JARVIS está diciendo, para animar el orbe. Lo escribe el hilo de voz.
+OUTPUT_LEVEL = [0.0]
+
+
 def _play_chunks(chunks: Iterable, stop: threading.Event) -> None:
     """Reproduce el audio a medida que llega; abre la salida con el primer bloque."""
+    import numpy as np
     import sounddevice as sd
 
     stream = None
@@ -428,8 +433,10 @@ def _play_chunks(chunks: Iterable, stop: threading.Event) -> None:
             if stream is None:
                 stream = sd.OutputStream(samplerate=OUTPUT_RATE, channels=1, dtype="float32", latency="low")
                 stream.start()
+            OUTPUT_LEVEL[0] = float(np.sqrt(np.mean(np.square(chunk)))) if len(chunk) else 0.0
             stream.write(chunk.reshape(-1, 1))
     finally:
+        OUTPUT_LEVEL[0] = 0.0
         if stream is not None:
             if stop.is_set():
                 stream.abort()
@@ -521,6 +528,11 @@ class Voice:
     def speaking(self) -> bool:
         thread = self._speech_thread
         return thread is not None and thread.is_alive()
+
+    @property
+    def output_level(self) -> float:
+        """Volumen actual de la voz de JARVIS (0 si no habla)."""
+        return OUTPUT_LEVEL[0] if self.speaking else 0.0
 
     def preload(self) -> None:
         threading.Thread(target=self._safe_preload, daemon=True).start()

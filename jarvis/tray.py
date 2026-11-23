@@ -74,6 +74,7 @@ class SystemTray:
         show_window: Callable[[], None],
         exit_window: Callable[[], None],
         tray_changed: Callable[[bool], None],
+        icon_path: str | None = None,
     ):
         self.root = root
         self._show_window = show_window
@@ -114,7 +115,13 @@ class SystemTray:
         register_message = _bind(user, "RegisterWindowMessageW", uint, wintypes.LPCWSTR)
         self._window = get_ancestor(root.winfo_id(), GA_ROOT)
         self._taskbar_created = register_message("TaskbarCreated")
-        icon = load_icon(None, ct.c_void_p(IDI_APPLICATION))
+        icon = None
+        if icon_path:
+            load_image = _bind(user, "LoadImageW", wintypes.HANDLE, wintypes.HINSTANCE, wintypes.LPCWSTR,
+                               uint, ct.c_int, ct.c_int, uint)
+            icon = load_image(None, icon_path, 1, 0, 0, 0x10 | 0x40)  # IMAGE_ICON, LR_LOADFROMFILE|LR_DEFAULTSIZE
+        if not icon:
+            icon = load_icon(None, ct.c_void_p(IDI_APPLICATION))
         if not self._window or not self._taskbar_created or not icon:
             raise OSError("No se pudo inicializar la bandeja de JARVIS.")
 

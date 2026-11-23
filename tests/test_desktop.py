@@ -135,7 +135,7 @@ class DesktopTests(unittest.TestCase):
         tray = Mock(available=True)
         with patch("jarvis.desktop.SystemTray", return_value=tray) as install:
             self.window.enable_tray()
-        _, show_from_icon, exit_from_menu, tray_changed = install.call_args.args
+        _, show_from_icon, exit_from_menu, tray_changed, *_ = install.call_args.args
         self.assertEqual(str(self.window.hide_button["state"]), "normal")
 
         with (
