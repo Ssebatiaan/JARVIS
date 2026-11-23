@@ -2,9 +2,10 @@
 
 import ctypes as ct
 import os
+import re
 from ctypes import wintypes
 from dataclasses import dataclass
-from time import sleep
+from time import monotonic, sleep
 
 from .text import normalize
 from .tools import TargetNotFound
@@ -19,10 +20,30 @@ VK_MENU = 0x12
 VK_LWIN = 0x5B
 VK_D = 0x44
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+ASFW_ANY = 0xFFFFFFFF
+KNOWN_BROWSERS = ("opera", "chrome", "msedge", "firefox", "brave", "vivaldi")
+DEFAULT_BROWSER_KEY = r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice"
 MEDIA_KEYS = {"play_pause": 0xB3, "next": 0xB0, "previous": 0xB1, "stop": 0xB2, "mute": 0xAD}
 # Procesos del sistema cuyas ventanas no se ofrecen para cerrar o enfocar.
 SYSTEM_PROCESSES = {"explorer", "searchhost", "shellexperiencehost", "startmenuexperiencehost",
                     "textinputhost", "applicationframehost", "lockapp", "systemsettings", "nvidia overlay"}
+
+
+def default_browser_process() -> str | None:
+    """Nombre del ejecutable del navegador predeterminado para https (por ejemplo «opera»)."""
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, DEFAULT_BROWSER_KEY) as key:
+            prog_id = winreg.QueryValueEx(key, "ProgId")[0]
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, prog_id + r"\shell\open\command") as key:
+            command = winreg.QueryValueEx(key, "")[0]
+    except OSError:
+        return None
+    match = re.match(r'\s*"([^"]+)"|\s*(\S+)', command)
+    if not match:
+        return None
+    return os.path.splitext(os.path.basename(match[1] or match[2]))[0].lower()
 
 
 @dataclass(frozen=True)
@@ -57,6 +78,8 @@ class _Win32:
                                     ct.POINTER(wintypes.DWORD))
         self.show = _bind(user, "ShowWindow", wintypes.BOOL, hwnd, ct.c_int)
         self.foreground = _bind(user, "SetForegroundWindow", wintypes.BOOL, hwnd)
+        self.current_foreground = _bind(user, "GetForegroundWindow", hwnd)
+        self.allow_foreground = _bind(user, "AllowSetForegroundWindow", wintypes.BOOL, wintypes.DWORD)
         self.post = _bind(user, "PostMessageW", wintypes.BOOL, hwnd, wintypes.UINT,
                           wintypes.WPARAM, wintypes.LPARAM)
         self.key = _bind(user, "keybd_event", None, wintypes.BYTE, wintypes.BYTE, wintypes.DWORD,
@@ -150,8 +173,7 @@ class DesktopControl:
             raise TargetNotFound(query, [])
         return scored[0][1]
 
-    def focus(self, query: str) -> WindowInfo:
-        window = self.find(query)
+    def _raise(self, window: WindowInfo) -> None:
         api = self._api
         if api.iconic(window.handle):
             api.show(window.handle, SW_RESTORE)
@@ -159,7 +181,29 @@ class DesktopControl:
             # Windows solo cede el foco a quien recibió la última entrada; un toque de Alt lo permite.
             api.tap(VK_MENU, extended=False)
             api.foreground(window.handle)
+
+    def focus(self, query: str) -> WindowInfo:
+        window = self.find(query)
+        self._raise(window)
         return window
+
+    def allow_others_to_take_focus(self) -> None:
+        """Permite que el programa al que se pasa un enlace se ponga al frente por sí mismo."""
+        self._api.allow_foreground(ASFW_ANY)
+
+    def bring_browser_forward(self, process: str | None, timeout: float = 3.0) -> WindowInfo | None:
+        """Espera la ventana del navegador y la trae al frente si quedó detrás."""
+        names = (process,) if process else KNOWN_BROWSERS
+        deadline = monotonic() + timeout
+        while monotonic() < deadline:
+            sleep(0.25)
+            windows = [window for window in self.windows() if window.process in names]
+            if windows:
+                window = windows[0]  # EnumWindows va de arriba abajo: la más reciente primero
+                if self._api.current_foreground() != window.handle:
+                    self._raise(window)
+                return window
+        return None
 
     def close(self, query: str) -> WindowInfo:
         window = self.find(query)

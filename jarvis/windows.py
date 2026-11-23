@@ -3,13 +3,14 @@ import errno
 import os
 import stat
 import subprocess
+import threading
 from ctypes import wintypes
 from pathlib import Path
 from time import sleep
 
 from . import apps as app_catalog
 from .audio import read_default_volume, set_default_volume
-from .control import DesktopControl
+from .control import DesktopControl, default_browser_process
 from .memory import MemoryStore
 from .web import find_youtube_video
 from .tools import FolderRedirected, LocalFolder, MemoryItem, ProcessInfo, SystemUsage, VolumeStatus
@@ -114,7 +115,20 @@ class WindowsTools:
     def open_url(self, url: str) -> None:
         if not url.startswith("https://"):
             raise PermissionError("Solo se abren direcciones https.")
+        control = self._control()
+        control.allow_others_to_take_focus()
         os.startfile(url)  # navegador predeterminado
+        # Un navegador ya abierto no puede ponerse al frente solo: JARVIS lo trae.
+        threading.Thread(
+            target=self._raise_browser, args=(control,), name="jarvis-navegador", daemon=True,
+        ).start()
+
+    @staticmethod
+    def _raise_browser(control: DesktopControl) -> None:
+        try:
+            control.bring_browser_forward(default_browser_process())
+        except OSError:
+            pass
 
     def find_video(self, query: str) -> tuple[str, str] | None:
         return find_youtube_video(query)

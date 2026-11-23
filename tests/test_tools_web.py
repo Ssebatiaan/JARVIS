@@ -184,3 +184,28 @@ class PersonaTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BrowserFocusTests(unittest.TestCase):
+    def control(self, windows, foreground):
+        from jarvis.control import DesktopControl, WindowInfo
+
+        control = DesktopControl.__new__(DesktopControl)
+        control._api = Mock(current_foreground=Mock(return_value=foreground), iconic=Mock(return_value=False),
+                            foreground=Mock(return_value=True))
+        control.windows = Mock(side_effect=[[], [WindowInfo(*item) for item in windows]] + [[]] * 20)
+        return control
+
+    def test_raises_the_browser_window_left_behind(self):
+        control = self.control([(7, "Back In Black - YouTube - Opera", "opera"), (9, "VS Code", "code")], 1)
+        window = control.bring_browser_forward("opera", timeout=2)
+        self.assertEqual(window.handle, 7)
+        control._api.foreground.assert_called_once_with(7)
+
+    def test_leaves_it_alone_when_already_in_front_and_gives_up_quietly(self):
+        control = self.control([(7, "YouTube - Opera", "opera")], 7)
+        control.bring_browser_forward("opera", timeout=2)
+        control._api.foreground.assert_not_called()
+        control = self.control([(9, "VS Code", "code")], 1)
+        self.assertIsNone(control.bring_browser_forward("opera", timeout=0.6))
+        control._api.foreground.assert_not_called()
