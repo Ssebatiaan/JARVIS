@@ -43,6 +43,11 @@ SENSITIVITY_COMMANDS = {
     "sensibilidad alta": "alta", "sube la sensibilidad": "alta", "sensibilidad normal": "normal",
     "sensibilidad baja": "baja", "baja la sensibilidad": "baja",
 }
+ENROLL_COMMANDS = {
+    "aprende mi voz", "entrena hey jarvis", "calibra hey jarvis", "entrena tu oido",
+    "aprende a reconocerme", "entrena mi voz",
+}
+FORGET_VOICE_COMMANDS = {"olvida mi voz", "borra mi voz"}
 WAKE_COMMANDS = {
     "activa hey jarvis": True, "activa la palabra de activacion": True, "escuchame siempre": True,
     "desactiva hey jarvis": False, "desactiva la palabra de activacion": False,
@@ -64,8 +69,10 @@ STATE_COLORS = {
     "Cancelado": MUTED,
     "Escuchando…": LISTEN,
     "Transcribiendo…": CYAN,
+    "Grabando…": LISTEN,
+    "Aprendiendo…": CYAN,
 }
-BUSY_STATES = {"En ejecución", "Cancelando…", "Transcribiendo…"}
+BUSY_STATES = {"En ejecución", "Cancelando…", "Transcribiendo…", "Aprendiendo…"}
 RESULT_STATUSES = {0: "Completado", 1: "Error", 2: "Detenido", 130: "Cancelado"}
 
 
@@ -123,6 +130,59 @@ def _listen_task(voice, listen: _Listen) -> None:
         listen.events.put(("error", str(error)))
     except Exception:
         listen.events.put(("error", "No pude usar el micrófono."))
+
+
+@dataclass
+class _Enrollment:
+    events: SimpleQueue = field(default_factory=SimpleQueue)
+    cancelled: Event = field(default_factory=Event)
+
+
+def _enroll_beep(double: bool = False) -> None:
+    try:
+        import winsound
+
+        winsound.Beep(988 if not double else 784, 120)
+        if double:
+            winsound.Beep(784, 120)
+    except (ImportError, RuntimeError):
+        pass
+
+
+def _enroll_task(enrollment: _Enrollment, folder, recorder, trainer) -> None:
+    """Guía la grabación (6 «Hey Jarvis» y una lectura) y entrena el verificador personal."""
+    from time import sleep
+
+    from .wake import ENROLL_PHRASE, ENROLL_SAMPLES, ENROLL_SECONDS, READING_SECONDS
+
+    post = enrollment.events.put
+    try:
+        positives = []
+        for index in range(1, ENROLL_SAMPLES + 1):
+            post(("prompt", f"Diga «Hey Jarvis» con su tono de siempre, justo después del pitido "
+                            f"({index} de {ENROLL_SAMPLES}). Esc cancela."))
+            sleep(0.9)
+            if enrollment.cancelled.is_set():
+                return
+            _enroll_beep()
+            positives.append(recorder(ENROLL_SECONDS))
+        post(("prompt", f"Ahora lea en voz alta, con calma, y repita si le sobra tiempo:\n«{ENROLL_PHRASE}»\n"
+                        "Empiece después del doble pitido."))
+        sleep(4)
+        if enrollment.cancelled.is_set():
+            return
+        _enroll_beep(double=True)
+        reading = recorder(READING_SECONDS)
+        if enrollment.cancelled.is_set():
+            return
+        post(("learning", "Aprendiendo su voz, señor. La primera vez puede tardar alrededor de un minuto."))
+        report = trainer(folder, positives, [reading])
+        extra = "" if report.with_references else (
+            " Sin internet lo entrené en modo estricto; repítalo con conexión para afinarlo más.")
+        post(("done", f"Listo, señor. Ya conozco su voz: reconocí {report.detected} de {report.total} "
+                      f"grabaciones. Pruebe a decir «Hey Jarvis».{extra}"))
+    except Exception as error:
+        post(("error", f"No pude aprender su voz: {error}"))
 
 
 def _run_task(
@@ -199,6 +259,11 @@ class DesktopWindow:
         self._greeted = False
         self._wake = None
         self._wake_folder = None
+        self._enrollment: _Enrollment | None = None
+        from . import wake as wake_module
+
+        self.enroll_recorder = wake_module.record
+        self.enroll_trainer = wake_module.train_personal_verifier
         self._wake_heard = Event()
         self._wake_after: str | None = None
         stored = preferences.get_setting(SPEECH_SETTING, "1") if preferences is not None else "1"
@@ -508,7 +573,8 @@ class DesktopWindow:
 
     def _hide_if_blurred(self) -> None:
         self._blur_after = None
-        if not self.hide_on_blur or self._closing or self._task is not None or self._listen is not None:
+        if (not self.hide_on_blur or self._closing or self._task is not None or self._listen is not None
+                or self._enrollment is not None):
             return
         try:
             focused = self.root.focus_get()
@@ -535,7 +601,9 @@ class DesktopWindow:
             self._listen_hotkey = None
 
     def _escape(self) -> None:
-        if self._listen is not None:
+        if self._enrollment is not None:
+            self._enrollment.cancelled.set()
+        elif self._listen is not None:
             self.cancel_listening()
         elif self.voice is not None and self._task is None and self.voice.speaking:
             self.voice.stop_speaking()
@@ -725,15 +793,99 @@ class DesktopWindow:
             return
         if self._wake_heard.is_set():
             self._wake_heard.clear()
-            if self._listen is None and self._task is None and self._approval is None:
+            if (self._listen is None and self._task is None and self._approval is None
+                    and self._enrollment is None):
                 _wake_chime()
                 self.listen_from_hotkey()
         if self._wake.error and self.hint["text"] != f"«Hey Jarvis» no disponible: {self._wake.error}":
             self.hint.configure(text=f"«Hey Jarvis» no disponible: {self._wake.error}")
         self._wake_after = self.root.after(100, self._poll_wake)
 
+    def start_enrollment(self) -> str | None:
+        """Empieza el entrenamiento guiado de «Hey Jarvis» con la voz del usuario."""
+        if self.voice is None or self._wake_folder is None:
+            return "Necesito la voz instalada para aprender su voz, señor."
+        if self._enrollment is not None or self._task is not None or self._listen is not None:
+            return None
+        enrollment = _Enrollment()
+        self._enrollment = enrollment
+        if self._wake is not None:
+            self._wake.pause()
+        self.voice.stop_speaking()
+        self.entry.configure(state="disabled")
+        self.execute_button.configure(state="disabled")
+        self.mic_button.configure(state="disabled")
+        self.status.set("Grabando…")
+        Thread(target=_enroll_task, args=(enrollment, self._wake_folder, self.enroll_recorder,
+                                          self.enroll_trainer), name="jarvis-aprender-voz", daemon=True).start()
+        self.root.after(50, self._poll_enrollment)
+        return None
+
+    def _poll_enrollment(self) -> None:
+        enrollment = self._enrollment
+        if enrollment is None or self._closing:
+            return
+        finished = None
+        try:
+            while True:
+                kind, message = enrollment.events.get_nowait()
+                if kind == "prompt":
+                    self._set_output(message)
+                elif kind == "learning":
+                    self.status.set("Aprendiendo…")
+                    self._set_output(message)
+                else:
+                    finished = (kind, message)
+                    break
+        except Empty:
+            pass
+        if finished is None and not enrollment.cancelled.is_set():
+            self.root.after(50, self._poll_enrollment)
+            return
+        if finished is None:
+            # Cancelado: se espera a que el hilo termine la grabación en curso.
+            self.root.after(50, self._finish_cancelled_enrollment)
+            return
+        self._end_enrollment()
+        kind, message = finished
+        self.status.set("Completado" if kind == "done" else "Error")
+        self._set_output(message)
+        if kind == "done" and self._wake is not None:
+            self._wake.reload_verifier()
+            self._refresh_hint()
+        if self.speak_enabled:
+            self.voice.say(message)
+
+    def _finish_cancelled_enrollment(self) -> None:
+        self._end_enrollment()
+        self.status.set("Cancelado")
+        self._set_output("Entrenamiento cancelado, señor. Todo sigue como estaba.")
+
+    def _end_enrollment(self) -> None:
+        self._enrollment = None
+        if self._wake is not None:
+            self._wake.resume()
+        self._set_busy(False)
+        self.mic_button.configure(state="normal" if self.voice is not None else "disabled")
+
+    def _forget_voice(self) -> str:
+        from .wake import forget_personal_verifier
+
+        if self._wake_folder is None or not forget_personal_verifier(self._wake_folder):
+            return "No tenía guardada su voz, señor."
+        if self._wake is not None:
+            self._wake.reload_verifier()
+            self._refresh_hint()
+        return "He olvidado su voz, señor. Vuelvo al reconocimiento genérico de «Hey Jarvis»."
+
     def _refresh_hint(self) -> None:
-        wake = "Di «Hey Jarvis», " if self._wake is not None else ""
+        personal = self._wake is not None and getattr(self._wake, "personal", False)
+        if self._wake is None:
+            wake = ""
+        elif personal:
+            wake = "Di «Hey Jarvis», "
+        else:
+            wake = "Di «Hey Jarvis» («aprende mi voz» lo afina), "
         self.hint.configure(
             text=f"{wake}{LISTEN_HOTKEY_LABEL} o Tab para hablar · {HOTKEY_LABEL} escribir · "
                  "Enter ejecutar · Esc ocultar · ↑↓ historial"
@@ -749,6 +901,19 @@ class DesktopWindow:
             self.close()
             return
         spoken = normalize(text).strip(" .¿?¡!")
+        if spoken in ENROLL_COMMANDS:
+            self.command.set("")
+            problem = self.start_enrollment()
+            if problem:
+                self.status.set("Detenido")
+                self._set_output(problem)
+            return
+        if spoken in FORGET_VOICE_COMMANDS:
+            self.command.set("")
+            message = self._forget_voice()
+            self.status.set("Completado")
+            self._set_output(message)
+            return
         toggle = WAKE_COMMANDS.get(spoken)
         level = SENSITIVITY_COMMANDS.get(spoken)
         if toggle is not None or level is not None:
@@ -844,6 +1009,8 @@ class DesktopWindow:
             self.voice.say(result.message)
 
     def _destroy(self) -> None:
+        if self._enrollment is not None:
+            self._enrollment.cancelled.set()
         self.disable_wake_word()
         self.cancel_listening()
         if self.voice is not None:

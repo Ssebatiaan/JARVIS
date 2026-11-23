@@ -144,6 +144,11 @@ class FakeListener:
     def resume(self):
         self.calls.append("resume")
 
+    personal = False
+
+    def reload_verifier(self):
+        self.calls.append("reload")
+
 
 class Preferences(dict):
     def get_setting(self, key, default=None):
