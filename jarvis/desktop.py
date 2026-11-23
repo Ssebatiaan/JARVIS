@@ -2,6 +2,7 @@
 
 import ctypes as ct
 import math
+import sqlite3
 import tkinter as tk
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -288,6 +289,8 @@ class DesktopWindow:
         self._wake_heard = Event()
         self._clap_heard = Event()
         self._wake_after: str | None = None
+        self._reminders = None  # ReminderClock (jarvis/reminders.py)
+        self._reminders_after: str | None = None
         stored = preferences.get_setting(SPEECH_SETTING, "1") if preferences is not None else "1"
         self.speak_enabled = voice is not None and stored == "1"
         self.speed = DEFAULT_VOICE_SPEED
@@ -896,6 +899,54 @@ class DesktopWindow:
             self.hint.configure(text=f"«Hey Jarvis» no disponible: {self._wake.error}")
         self._wake_after = self.root.after(100, self._poll_wake)
 
+    # --- recordatorios, alarmas y temporizadores ------------------------------------
+
+    def enable_reminders(self, store) -> None:
+        from .reminders import ReminderClock
+
+        self._reminders = ReminderClock(store)
+        self._reminders_after = self.root.after(1000, self._poll_reminders)
+
+    def _refresh_reminders(self) -> None:
+        if self._reminders is not None:
+            try:
+                self._reminders.refresh()
+            except (OSError, sqlite3.Error):
+                pass
+
+    def _poll_reminders(self) -> None:
+        self._reminders_after = None
+        if self._closing or self._reminders is None:
+            return
+        busy = (self._task is not None or self._listen is not None or self._approval is not None
+                or self._enrollment is not None)
+        if not busy:  # si está ocupado, el aviso espera unos segundos
+            try:
+                due = self._reminders.due()
+            except (OSError, sqlite3.Error):
+                due = []
+            if due:
+                self.announce(due)
+        self._reminders_after = self.root.after(1000, self._poll_reminders)
+
+    def announce(self, reminders) -> None:
+        from .reminders import announcement
+
+        message = " ".join(announcement(reminder) for reminder in reminders)
+        speaks = self.speak_enabled and self.voice is not None
+        if self.floating_orb is not None:
+            self.floating_orb.show()
+        if self.root.state() == "withdrawn" and (not speaks or self.floating_orb is None):
+            self.root.deiconify()  # sin voz (o sin orbe), que al menos se vea
+            self._fit()
+        self.status.set("Completado")
+        self._set_output(message)
+        loud = any(reminder.kind != "recordatorio" for reminder in reminders)
+        Thread(target=_reminder_chime, args=(loud,), name="jarvis-aviso", daemon=True).start()
+        if speaks:
+            self.voice.stop_speaking()
+            self.root.after(1100 if loud else 450, lambda: self.voice.say(message))
+
     def start_enrollment(self) -> str | None:
         """Empieza el entrenamiento guiado de «Hey Jarvis» con la voz del usuario."""
         if self.voice is None or self._wake_folder is None:
@@ -1139,6 +1190,7 @@ class DesktopWindow:
         if self._closing:
             self._destroy()
             return
+        self._refresh_reminders()  # la orden pudo añadir o cancelar un aviso
         self.status.set(RESULT_STATUSES.get(result.code, "Detenido"))
         self._set_busy(False)
         self.command.set("")
@@ -1189,13 +1241,13 @@ class DesktopWindow:
         self.cancel_listening()
         if self.voice is not None:
             self.voice.stop_speaking()
-        for after_id in (self._animation_after, self._blur_after):
+        for after_id in (self._animation_after, self._blur_after, self._reminders_after):
             if after_id is not None:
                 try:
                     self.root.after_cancel(after_id)
                 except tk.TclError:
                     pass
-        self._animation_after = self._blur_after = None
+        self._animation_after = self._blur_after = self._reminders_after = None
         self.release_tray()
         self.root.destroy()
 
@@ -1230,6 +1282,19 @@ def _wake_chime() -> None:
         import winsound
 
         winsound.Beep(988, 90)
+    except (ImportError, RuntimeError):
+        pass
+
+
+def _reminder_chime(loud: bool) -> None:
+    """Campanilla de aviso: tres tonos para alarmas y temporizadores, dos para recordatorios."""
+    try:
+        import winsound
+
+        for tone in ((784, 1046, 1318) if loud else (880, 1175)):
+            winsound.Beep(tone, 140)
+        if loud:
+            winsound.Beep(1318, 260)
     except (ImportError, RuntimeError):
         pass
 
@@ -1293,6 +1358,8 @@ def run_window(tools: LocalTools, audit: Audit, brain=None, *, start_hidden: boo
     window.enable_tray(_tray_icon(data_folder))
     window.enable_hotkey()
     window.enable_wake_word(wake_folder)
+    if preferences is not None and hasattr(preferences, "next_due"):
+        window.enable_reminders(preferences)
     window.floating_orb = _create_orb(root, window, preferences, voice)
     if window.floating_orb is not None:
         window.anchor = window.floating_orb.chat_position

@@ -28,7 +28,10 @@ MAX_PROMPT_CHARS = 24_000
 NOTE_LIMIT = 300
 
 TIME_NOTE_SECONDS = 300
-TIME_WORDS = re.compile(r"hora|fecha|hoy|mañana|día|dia|minutos?", re.IGNORECASE)
+TIME_WORDS = re.compile(
+    r"\b(?:hora|fecha|hoy|mañana|día|dia|minutos?|recuerd\w*|av[ií]s\w*|alarma|temporizador|despi[eé]rt\w*|semana|"
+    r"lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo)\b", re.IGNORECASE
+)
 WEEKDAYS = ("lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo")
 MONTHS = ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre",
           "octubre", "noviembre", "diciembre")
@@ -59,6 +62,17 @@ TOOL_CATALOG = (
     ("audio.set_volume", '{"percent": entero de 0 a 100}',
      "ajusta el volumen; JARVIS pedirá aprobación al usuario"),
     ("system.processes", "{}", "lista los procesos abiertos"),
+    ("system.top", '{"by": "ram" | "cpu"}', "dice qué programas consumen más RAM o CPU ahora mismo"),
+    ("system.gpu", "{}", "uso, VRAM y temperatura de la GPU NVIDIA"),
+    ("reminders.add", '{"text": "qué recordar, o \\"\\" si no se dijo", "due": "AAAA-MM-DDTHH:MM:SS en hora local", '
+                      '"kind": "recordatorio" | "alarma" | "temporizador"}',
+     "programa un aviso; calcula «due» sumando a la fecha y hora local actuales"),
+    ("reminders.list", "{}", "lista los recordatorios, alarmas y temporizadores pendientes"),
+    ("reminders.cancel", '{"reminder_id": entero, 0 = el más próximo}', "cancela un aviso pendiente"),
+    ("system.power", '{"action": "shutdown" | "restart" | "sleep"}',
+     "apaga, reinicia o suspende el equipo tras una cuenta atrás; JARVIS pedirá aprobación"),
+    ("system.lock", "{}", "bloquea el equipo (pantalla de inicio de sesión)"),
+    ("system.power_cancel", "{}", "cancela un apagado, reinicio o suspensión pendiente"),
     ("memory.list", "{}", "muestra lo que recuerdas del usuario"),
     ("memory.forget", '{"memory_id": entero}', "olvida un recuerdo por su número"),
     ("memory.clear", "{}", "olvida todos los recuerdos; JARVIS pedirá aprobación"),

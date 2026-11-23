@@ -13,7 +13,20 @@ from .audio import read_default_volume, set_default_volume
 from .control import DesktopControl, default_browser_process
 from .memory import MemoryStore
 from .web import find_youtube_video
-from .tools import FolderRedirected, LocalFolder, MemoryItem, ProcessInfo, SystemUsage, VolumeStatus
+from .tools import (
+    POWER_DELAY_SECONDS,
+    FolderRedirected,
+    GpuReading,
+    LocalFolder,
+    MemoryItem,
+    ProcessInfo,
+    ProgramUsage,
+    Reminder,
+    SystemUsage,
+    VolumeStatus,
+)
+
+CREATE_NO_WINDOW = 0x08000000
 
 TH32CS_SNAPPROCESS = 0x00000002
 ERROR_NO_MORE_FILES = 18
@@ -59,6 +72,8 @@ class WindowsTools:
         self._apps = app_catalog.AppCatalog()
         self._desktop: DesktopControl | None = None
         self._dismiss_requested = threading.Event()
+        self._pending_power: str | None = None  # "shutdown", "restart" o "sleep"
+        self._sleep_timer: threading.Timer | None = None
 
         kernel = ct.WinDLL("kernel32.dll", use_last_error=True)
         self._system_directory = kernel.GetSystemDirectoryW
@@ -196,6 +211,71 @@ class WindowsTools:
     def clear_memories(self) -> int:
         return self._memory_store().forget_everything()
 
+    # --- hardware ------------------------------------------------------------------
+
+    def read_gpu(self) -> GpuReading | None:
+        from .hardware import read_gpu
+
+        gpu = read_gpu()
+        if gpu is None:
+            return None
+        return GpuReading(gpu.name, gpu.utilization, gpu.memory_used_mib, gpu.memory_total_mib, gpu.temperature)
+
+    def top_programs(self) -> list[ProgramUsage]:
+        from .hardware import top_processes
+
+        return [ProgramUsage(item.name, item.instances, item.memory_mib, item.cpu_percent)
+                for item in top_processes()]
+
+    # --- recordatorios ----------------------------------------------------------------
+
+    def add_reminder(self, text: str, due, kind: str) -> int:
+        return self._memory_store().add_reminder(text, due, kind)
+
+    def list_reminders(self) -> list[Reminder]:
+        return self._memory_store().pending_reminders()
+
+    def cancel_reminder(self, reminder_id: int) -> Reminder | None:
+        return self._memory_store().cancel_reminder(reminder_id)
+
+    # --- energía ----------------------------------------------------------------------
+
+    def _shutdown_exe(self, *arguments: str) -> None:
+        exe = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "shutdown.exe"
+        completed = subprocess.run([str(exe), *arguments], capture_output=True, creationflags=CREATE_NO_WINDOW,
+                                   timeout=10)
+        if completed.returncode != 0:
+            raise OSError(completed.returncode, "shutdown.exe rechazó la orden")
+
+    def power(self, action: str) -> None:
+        self.cancel_power()
+        delay = POWER_DELAY_SECONDS[action]
+        if action == "sleep":
+            timer = threading.Timer(delay, _suspend)
+            timer.daemon = True
+            timer.start()
+            self._sleep_timer = timer
+        else:
+            flag = "/s" if action == "shutdown" else "/r"
+            self._shutdown_exe(flag, "/t", str(delay), "/c", "JARVIS: orden del usuario.")
+        self._pending_power = action
+
+    def cancel_power(self) -> bool:
+        pending, self._pending_power = self._pending_power, None
+        if self._sleep_timer is not None:
+            self._sleep_timer.cancel()
+            self._sleep_timer = None
+        if pending in ("shutdown", "restart"):
+            try:
+                self._shutdown_exe("/a")
+            except (OSError, subprocess.SubprocessError):
+                return False
+        return pending is not None
+
+    def lock(self) -> None:
+        if not ct.WinDLL("user32.dll", use_last_error=True).LockWorkStation():
+            raise ct.WinError(ct.get_last_error())
+
     def _cpu_times(self) -> tuple[int, int]:
         idle = wintypes.FILETIME()
         kernel = wintypes.FILETIME()
@@ -229,3 +309,10 @@ class WindowsTools:
             ram_total_bytes=memory.total_physical,
             ram_available_bytes=memory.available_physical,
         )
+
+
+def _suspend() -> None:
+    """Suspensión (no hibernación). Despierta con el botón de encendido o el teclado."""
+    powrprof = ct.WinDLL("powrprof.dll")
+    powrprof.SetSuspendState.argtypes = [wintypes.BOOLEAN, wintypes.BOOLEAN, wintypes.BOOLEAN]
+    powrprof.SetSuspendState(False, False, False)

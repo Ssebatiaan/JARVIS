@@ -10,6 +10,7 @@ from uuid import uuid4
 from .audit import Audit
 from .brain import BrainUnavailable, Decision
 from .web import site_key
+from .when import parse_reminder
 from . import persona as jarvis_persona
 from .tools import (
     DEFAULT_PERMISSIONS,
@@ -88,6 +89,31 @@ FORGET_PATTERN = re.compile(r"olvida (?:el )?recuerdo (?:numero |n\.?o )?([0-9]{
 CLEAR_MEMORY_COMMANDS = {"olvida todo", "olvida todo lo que sabes de mi", "borra tu memoria"}
 MEMORY_MUTATIONS = {ToolId.SAVE_MEMORY, ToolId.FORGET_MEMORY, ToolId.CLEAR_MEMORIES}
 SENSITIVE_PATTERN = re.compile(r"contrasen|password|clave|\bpin\b|tarjeta|cvv|token|cuenta bancaria")
+_HARDWARE_QUESTION = r"^(?:cuanto|cuanta|que|como|cual|dime|consulta|muestra|muestrame|revisa|estado|uso|temperatura)\b"
+GPU_PATTERN = re.compile(_HARDWARE_QUESTION + r".*\b(?:gpu|grafica|tarjeta de video|tarjeta grafica|vram|nvidia)\b")
+TOP_PATTERN = re.compile(
+    r"^(?:que|cual|cuales|dime|muestra|muestrame)\b.*\b(?:consum|usa\b|usando|gasta|come|comiendo|chupa|ocupa)\w*"
+    r".*\b(?P<by>ram|memoria|cpu|procesador)\b"
+)
+REMINDER_LIST_PATTERN = re.compile(
+    r"^(?:que|cuales|cuantos|mis|lista|listar|muestra|muestrame|dime|ver)\b.*\b(?:recordatorios?|alarmas?|"
+    r"temporizador(?:es)?|avisos?)\b(?: (?:pendientes|tengo|hay|programados?|activos?))*$"
+    r"|^cuanto (?:le )?falta(?: (?:al|para el) temporizador| para (?:la alarma|el aviso|el recordatorio))?$"
+)
+REMINDER_CANCEL_PATTERN = re.compile(
+    r"^(?:cancela|cancelar|borra|elimina|quita|deten|para|apaga)(?: el| la| mi)? "
+    r"(?:recordatorio|alarma|temporizador|aviso)(?: (?:numero |n\.?o )?(?P<id>\d{1,9}))?$"
+)
+_PC = r"(?: (?:el|la|mi))? (?:pc|computador|computadora|equipo|ordenador|portatil|laptop|maquina)"
+POWER_PATTERNS = (
+    (re.compile(rf"^(?:apaga|apagar|apagame){_PC}$"), ToolId.POWER, "shutdown"),
+    (re.compile(rf"^(?:reinicia|reiniciar|reiniciame){_PC}$"), ToolId.POWER, "restart"),
+    (re.compile(rf"^(?:suspende|suspender|duerme|pon a dormir){_PC}$|^pon{_PC} en suspension$"),
+     ToolId.POWER, "sleep"),
+    (re.compile(rf"^(?:bloquea|bloquear)(?:{_PC}| la pantalla| la sesion)$"), ToolId.LOCK, None),
+    (re.compile(r"^(?:cancela|cancelar|aborta|deten|para)(?: el| la)? (?:apagado|reinicio|suspension)$"
+                r"|^no (?:apagues|reinicies|suspendas)(?:" + _PC + r")?$"), ToolId.CANCEL_POWER, None),
+)
 APPROVAL_TIMEOUT_SECONDS = 60
 SEQUENCE_SEPARATOR = " y luego "
 MAX_SEQUENCE_STEPS = 5
@@ -100,7 +126,9 @@ HELP = (
     "(«reproduce Back in Black en YouTube»), buscar («busca recetas en Google»), controlar la música "
     "(«pausa», «siguiente canción»), manejar ventanas («cambia a Opera», «cierra Discord», "
     "«minimiza todo»), consultar CPU, RAM y volumen, ajustar el volumen, listar procesos y "
-    "recordar cosas («recuerda que…», «qué recuerdas», «olvida el recuerdo N»). "
+    "recordar cosas («recuerda que…», «qué recuerdas», «olvida el recuerdo N»), programar avisos "
+    "(«recuérdame en 20 minutos…», «pon un temporizador de 10 minutos»), revisar la GPU y lo que más "
+    "consume, y apagar, reiniciar, suspender o bloquear el equipo. "
     "Encadena hasta cinco órdenes con «y luego»."
 )
 
@@ -186,6 +214,24 @@ def _route(command: str, original: str | None = None) -> RoutedCommand:
     forget = FORGET_PATTERN.fullmatch(command)
     if forget:
         return ToolId.FORGET_MEMORY, {"memory_id": int(forget[1])}
+    reminder = parse_reminder(command)
+    if reminder is not None:
+        due, task, kind = reminder
+        return ToolId.ADD_REMINDER, {"text": _restore(original, task) if task else "",
+                                     "due": due.isoformat(timespec="seconds"), "kind": kind}
+    if REMINDER_LIST_PATTERN.match(command):
+        return ToolId.LIST_REMINDERS, {}
+    cancel = REMINDER_CANCEL_PATTERN.match(command)
+    if cancel:
+        return ToolId.CANCEL_REMINDER, {"reminder_id": int(cancel["id"] or 0)}
+    for pattern, tool_id, action in POWER_PATTERNS:
+        if pattern.match(command):
+            return tool_id, ({"action": action} if action else {})
+    if GPU_PATTERN.match(command):
+        return ToolId.GPU, {}
+    top = TOP_PATTERN.match(command)
+    if top:
+        return ToolId.TOP_PROGRAMS, {"by": "cpu" if top["by"] in ("cpu", "procesador") else "ram"}
     if command in METRIC_COMMANDS:
         return ToolId.SYSTEM_METRICS, {}
     if command in VOLUME_COMMANDS:

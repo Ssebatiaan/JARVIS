@@ -11,7 +11,7 @@ from datetime import datetime
 from .tools import ToolId
 
 REPORTS = {ToolId.SYSTEM_METRICS, ToolId.READ_VOLUME, ToolId.LIST_PROCESSES, ToolId.LIST_MEMORIES,
-           ToolId.TIME}
+           ToolId.TIME, ToolId.GPU, ToolId.TOP_PROGRAMS, ToolId.LIST_REMINDERS}
 REPORT_OPENERS = ("Aquí tiene, señor.", "Con mucho gusto, señor.", "Enseguida, señor.")
 ACTION_OPENERS = ("Enseguida, señor.", "Por supuesto, señor.", "Ahora mismo, señor.", "Como desee, señor.")
 DENIED = "Me temo que no ha sido posible, señor."

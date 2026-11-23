@@ -173,6 +173,9 @@ class DemoTests(unittest.TestCase):
             "recuerda que me llamo Ana", "qué recuerdas", "olvida el recuerdo 1", "olvida todo",
             "cambia a Discord", "cierra Discord", "minimiza todo", "pausa", "abre YouTube",
             "busca gatos en Google", "reproduce lofi en YouTube", "qué hora es", "eso sería todo, Jarvis",
+            "cuánto usa la GPU", "qué está consumiendo más RAM", "recuérdame en 5 minutos beber agua",
+            "qué recordatorios tengo", "cancela el temporizador", "apaga el pc", "bloquea el pc",
+            "cancela el apagado",
         )
         for command in commands:
             with self.subTest(command=command):

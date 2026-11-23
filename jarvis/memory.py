@@ -4,9 +4,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .tools import MAX_MEMORY_TEXT, MemoryFull, MemoryItem
+from .tools import MAX_MEMORY_TEXT, MAX_REMINDER_TEXT, MemoryFull, MemoryItem, Reminder, RemindersFull
 
 MAX_FACTS = 50
+MAX_PENDING_REMINDERS = 50
 HISTORY_LIMIT = 20
 
 
@@ -36,6 +37,11 @@ class MemoryStore:
         )
         connection.execute(
             "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS reminders ("
+            "id INTEGER PRIMARY KEY, text TEXT NOT NULL, due TEXT NOT NULL, kind TEXT NOT NULL, "
+            "created_at TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0)"
         )
         return connection
 
@@ -108,3 +114,55 @@ class MemoryStore:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, value),
             )
+
+    # --- recordatorios, alarmas y temporizadores (hora local) --------------------------
+
+    @staticmethod
+    def _reminder(row) -> Reminder:
+        return Reminder(row[0], row[1], datetime.fromisoformat(row[2]), row[3], datetime.fromisoformat(row[4]))
+
+    def add_reminder(self, text: str, due: datetime, kind: str) -> int:
+        text = " ".join(text.split())[:MAX_REMINDER_TEXT]
+        with closing(self._connect()) as connection, connection:
+            (count,) = connection.execute("SELECT COUNT(*) FROM reminders WHERE done = 0").fetchone()
+            if count >= MAX_PENDING_REMINDERS:
+                raise RemindersFull()
+            cursor = connection.execute(
+                "INSERT INTO reminders (text, due, kind, created_at) VALUES (?, ?, ?, ?)",
+                (text, due.replace(microsecond=0).isoformat(), kind,
+                 datetime.now().replace(microsecond=0).isoformat()),
+            )
+            return cursor.lastrowid
+
+    def pending_reminders(self) -> list[Reminder]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT id, text, due, kind, created_at FROM reminders WHERE done = 0 ORDER BY due, id"
+            ).fetchall()
+        return [self._reminder(row) for row in rows]
+
+    def cancel_reminder(self, reminder_id: int) -> Reminder | None:
+        """Cancela un aviso pendiente; con 0 cancela el más próximo."""
+        pending = self.pending_reminders()
+        chosen = pending[:1] if reminder_id == 0 else [item for item in pending if item.id == reminder_id]
+        if not chosen:
+            return None
+        with closing(self._connect()) as connection, connection:
+            connection.execute("UPDATE reminders SET done = 2 WHERE id = ?", (chosen[0].id,))
+        return chosen[0]
+
+    def next_due(self) -> datetime | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute("SELECT MIN(due) FROM reminders WHERE done = 0").fetchone()
+        return datetime.fromisoformat(row[0]) if row and row[0] else None
+
+    def take_due(self, now: datetime) -> list[Reminder]:
+        """Devuelve los avisos vencidos y los marca como avisados."""
+        moment = now.replace(microsecond=0).isoformat()
+        with closing(self._connect()) as connection, connection:
+            rows = connection.execute(
+                "SELECT id, text, due, kind, created_at FROM reminders WHERE done = 0 AND due <= ? "
+                "ORDER BY due, id", (moment,)
+            ).fetchall()
+            connection.executemany("UPDATE reminders SET done = 1 WHERE id = ?", [(row[0],) for row in rows])
+        return [self._reminder(row) for row in rows]
