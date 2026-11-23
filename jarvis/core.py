@@ -55,6 +55,15 @@ MEDIA_COMMANDS = {
     "previous": {"anterior", "cancion anterior", "la anterior", "vuelve a la cancion anterior"},
     "mute": {"silencia", "silencia el audio", "mutea", "quita el silencio"},
 }
+# «Eso sería todo, Jarvis»: se quita el nombre y la cortesía y se compara lo esencial.
+DISMISS_PATTERN = re.compile(
+    r"(?:(?:muchas )?gracias,? )?(?:eso (?:seria|es|fue|era) todo|eso nomas|es todo|nada mas|"
+    r"puedes retirarte|retirate|descansa|ocultate|escondete|desaparece|adios|chao|hasta luego|"
+    r"hasta manana|nos vemos|"
+    r"(?:esconde|oculta|quita) (?:el overlay|la interfaz|el orbe|todo))"
+    r"(?: por (?:hoy|ahora|el momento))?(?:,? (?:muchas )?gracias)?"
+    r"|(?:bueno |listo |ya )?me voy a (?:dormir|descansar|acostar)(?: .*)?"
+)
 TIME_COMMANDS = {
     "que hora es", "dime la hora", "que hora tenemos", "que dia es hoy", "que fecha es hoy",
     "a que estamos hoy", "que dia es", "que fecha es",
@@ -193,6 +202,10 @@ def _route(command: str, original: str | None = None) -> RoutedCommand:
         return ToolId.MINIMIZE_ALL, {}
     if command in TIME_COMMANDS:
         return ToolId.TIME, {}
+    farewell = re.sub(r"[,.!¡¿?]", " ", command)
+    farewell = " ".join(word for word in farewell.split() if word not in {"jarvis", "señor", "senor"})
+    if DISMISS_PATTERN.fullmatch(farewell):
+        return ToolId.DISMISS, {}
     for pattern in YOUTUBE_PLAY:
         match = pattern.fullmatch(command)
         if match:
@@ -462,10 +475,10 @@ def _run_with_brain(
         route = _route_from_model(decision.tool, decision.arguments)
         step = _run_step(route, tools, execution)
         _notify_memory(brain, route, step)
-        if persona and decision.reply and step.code == 0:
+        if persona and decision.reply and step.code == 0 and route[0] is not ToolId.DISMISS:
             messages.append(f"{decision.reply} {step.message}")
         elif persona:
-            messages.append(jarvis_persona.dress(route[0], step.code, step.message))
+            messages.append(jarvis_persona.dress(route[0], step.code, step.message))  # la despedida va sola
         else:
             messages.append(step.message)
         code, source = step.code, "tool"

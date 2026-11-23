@@ -38,6 +38,8 @@ def dress(tool_id: ToolId | None, code: int, message: str, *, rng: random.Random
     choose = (rng or random).choice
     if tool_id is None:
         return f"{NOT_UNDERSTOOD} {message}"
+    if tool_id is ToolId.DISMISS and code == 0:
+        return message
     if code == 0:
         opener = choose(REPORT_OPENERS if tool_id in REPORTS else ACTION_OPENERS)
         return f"{opener} {message}"

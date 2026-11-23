@@ -58,6 +58,7 @@ class WindowsTools:
         self._memory = memory
         self._apps = app_catalog.AppCatalog()
         self._desktop: DesktopControl | None = None
+        self._dismiss_requested = threading.Event()
 
         kernel = ct.WinDLL("kernel32.dll", use_last_error=True)
         self._system_directory = kernel.GetSystemDirectoryW
@@ -129,6 +130,15 @@ class WindowsTools:
             control.bring_browser_forward(default_browser_process())
         except OSError:
             pass
+
+    def dismiss(self) -> None:
+        """Pide a la interfaz que se oculte cuando termine de hablar."""
+        self._dismiss_requested.set()
+
+    def take_dismiss(self) -> bool:
+        requested = self._dismiss_requested.is_set()
+        self._dismiss_requested.clear()
+        return requested
 
     def find_video(self, query: str) -> tuple[str, str] | None:
         return find_youtube_video(query)

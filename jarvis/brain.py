@@ -52,6 +52,9 @@ TOOL_CATALOG = (
      "abre la carpeta del proyecto JARVIS o la de documentación"),
     ("system.metrics", "{}", "consulta el uso de CPU y RAM"),
     ("system.time", "{}", "dice la hora y la fecha actuales"),
+    ("assistant.dismiss", "{}",
+     "el usuario da por terminada la conversación o se despide («eso sería todo», «ya no necesito nada», "
+     "«me voy a dormir», «hasta mañana», «adiós»): JARVIS se despide y se oculta"),
     ("audio.volume", "{}", "consulta el volumen actual"),
     ("audio.set_volume", '{"percent": entero de 0 a 100}',
      "ajusta el volumen; JARVIS pedirá aprobación al usuario"),

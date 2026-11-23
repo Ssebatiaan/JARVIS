@@ -38,6 +38,7 @@ FONT = "Segoe UI"
 ICON_SEND, ICON_MIC, ICON_STOP = "\ue724", "\ue720", "\ue71a"
 ICON_VOLUME, ICON_MUTE, ICON_HIDE = "\ue767", "\ue74f", "\ue921"
 SPEECH_SETTING = "voz.respuestas"
+DISMISS_MAX_WAIT = 8.0
 WAKE_SETTING = "voz.activacion"
 SENSITIVITY_SETTING = "voz.sensibilidad"
 SENSITIVITY_COMMANDS = {
@@ -258,6 +259,7 @@ class DesktopWindow:
         self._listen: _Listen | None = None
         self._listen_hotkey: GlobalHotkey | None = None
         self._greeted = False
+        self._dismiss_deadline = 0.0
         self._wake = None
         self._wake_folder = None
         self.floating_orb = None  # orbe flotante (jarvis/orb.py), si Pillow está disponible
@@ -1034,6 +1036,24 @@ class DesktopWindow:
         self.entry.focus_set()
         if self.speak_enabled and self.voice is not None and result.message:
             self.voice.say(result.message)
+        take_dismiss = getattr(self.tools, "take_dismiss", None)
+        if callable(take_dismiss) and take_dismiss() is True:
+            self._dismiss_deadline = monotonic() + DISMISS_MAX_WAIT
+            self.root.after(400, self._finish_dismiss)
+
+    def _finish_dismiss(self) -> None:
+        """Espera a que JARVIS termine la despedida y oculta el orbe y el chat."""
+        if self._closing:
+            return
+        speaking = self.voice is not None and getattr(self.voice, "speaking", False)
+        if speaking and monotonic() < self._dismiss_deadline:
+            self.root.after(200, self._finish_dismiss)
+            return
+        if self._task is not None or self._listen is not None:
+            return  # el usuario volvió a hablarle antes de que se ocultara
+        if self.floating_orb is not None:
+            self.floating_orb.hide()
+        self.root.withdraw()
 
     def _destroy(self) -> None:
         if self.floating_orb is not None:

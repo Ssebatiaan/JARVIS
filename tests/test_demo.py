@@ -172,7 +172,7 @@ class DemoTests(unittest.TestCase):
             "consulta el volumen", "pon el volumen al 35 %", "lista procesos",
             "recuerda que me llamo Ana", "qué recuerdas", "olvida el recuerdo 1", "olvida todo",
             "cambia a Discord", "cierra Discord", "minimiza todo", "pausa", "abre YouTube",
-            "busca gatos en Google", "reproduce lofi en YouTube", "qué hora es",
+            "busca gatos en Google", "reproduce lofi en YouTube", "qué hora es", "eso sería todo, Jarvis",
         )
         for command in commands:
             with self.subTest(command=command):

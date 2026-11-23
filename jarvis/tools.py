@@ -87,6 +87,7 @@ class LocalTools(Protocol):
     def media_key(self, action: str) -> None: ...
     def open_url(self, url: str) -> None: ...
     def find_video(self, query: str) -> tuple[str, str] | None: ...
+    def dismiss(self) -> None: ...
     def open_folder(self, folder: LocalFolder) -> None: ...
     def read_usage(self) -> SystemUsage: ...
     def read_volume(self) -> VolumeStatus: ...
@@ -117,6 +118,7 @@ class ToolId(StrEnum):
     WEB_SEARCH = "web.search"
     PLAY_YOUTUBE = "youtube.play"
     TIME = "system.time"
+    DISMISS = "assistant.dismiss"
 
 
 class Permission(Enum):
@@ -138,6 +140,7 @@ class Permission(Enum):
     WEB_SEARCH = "web.search"
     PLAY_YOUTUBE = "youtube.play"
     READ_TIME = "system.time.read"
+    DISMISS = "assistant.dismiss"
 
 
 DEFAULT_PERMISSIONS = frozenset({
@@ -159,6 +162,7 @@ DEFAULT_PERMISSIONS = frozenset({
     Permission.WEB_SEARCH,
     Permission.PLAY_YOUTUBE,
     Permission.READ_TIME,
+    Permission.DISMISS,
 })
 
 MAX_MEMORY_TEXT = 300
@@ -293,6 +297,14 @@ def describe_time(now) -> str:
     article = "Es la" if now.hour % 12 == 1 else "Son las"
     return (f"{article} {now:%H:%M} del {WEEKDAYS[now.weekday()]} {now.day} de "
             f"{MONTHS[now.month - 1]} de {now.year}.")
+
+
+FAREWELL = "Como desee, señor. Estaré aquí si me necesita; basta con decir «Hey Jarvis»."
+
+
+def _dismiss(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
+    tools.dismiss()
+    return ToolOutcome(0, "completada", FAREWELL)
 
 
 def _read_time(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
@@ -443,6 +455,12 @@ TOOLS: Mapping[ToolId, ToolSpec] = MappingProxyType({
                 ArgumentSpec("query", str, max_length=200),
             ),
             invalid_arguments="Indica qué buscar y dónde: Google, YouTube o Wikipedia.",
+        ),
+        ToolSpec(
+            id=ToolId.DISMISS,
+            permission=Permission.DISMISS,
+            error_target="retirarme",
+            handler=_dismiss,
         ),
         ToolSpec(
             id=ToolId.TIME,
