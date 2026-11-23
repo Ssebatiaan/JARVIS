@@ -37,6 +37,12 @@ FONT = "Segoe UI"
 ICON_SEND, ICON_MIC, ICON_STOP = "\ue724", "\ue720", "\ue71a"
 ICON_VOLUME, ICON_MUTE, ICON_HIDE = "\ue767", "\ue74f", "\ue921"
 SPEECH_SETTING = "voz.respuestas"
+WAKE_SETTING = "voz.activacion"
+WAKE_COMMANDS = {
+    "activa hey jarvis": True, "activa la palabra de activacion": True, "escuchame siempre": True,
+    "desactiva hey jarvis": False, "desactiva la palabra de activacion": False,
+    "deja de escuchar hey jarvis": False, "no me escuches": False,
+}
 
 WIDTH = 720
 MAX_OUTPUT_LINES = 16
@@ -186,6 +192,10 @@ class DesktopWindow:
         self._listen: _Listen | None = None
         self._listen_hotkey: GlobalHotkey | None = None
         self._greeted = False
+        self._wake = None
+        self._wake_folder = None
+        self._wake_heard = Event()
+        self._wake_after: str | None = None
         stored = preferences.get_setting(SPEECH_SETTING, "1") if preferences is not None else "1"
         self.speak_enabled = voice is not None and stored == "1"
         self.hide_on_blur = False
@@ -598,6 +608,8 @@ class DesktopWindow:
             return
         listen = _Listen()
         self._listen = listen
+        if self._wake is not None:
+            self._wake.pause()  # el micrófono queda para la orden
         self.voice.stop_speaking()
         self._warm_voice()
         self.command.set("")
@@ -629,6 +641,8 @@ class DesktopWindow:
             self.root.after(30, self._poll_listen)
             return
         self._listen = None
+        if self._wake is not None:
+            self._wake.resume()
         self.orb.level = 0.0
         self.mic_button.configure(text=ICON_MIC, foreground=CYAN)
         self._set_busy(False)
@@ -646,6 +660,66 @@ class DesktopWindow:
             self.command.set(value)
             self.submit()
 
+    # --- palabra de activación ------------------------------------------------------------
+
+    def enable_wake_word(self, folder) -> None:
+        """Escucha «Hey Jarvis» en segundo plano si la voz está instalada y no se desactivó."""
+        self._wake_folder = folder
+        if self.voice is None or folder is None or self._wake is not None:
+            return
+        if self.preferences is not None and self.preferences.get_setting(WAKE_SETTING, "1") != "1":
+            self._refresh_hint()
+            return
+        from .wake import WakeWordListener
+
+        self._wake = WakeWordListener(folder, self._wake_heard.set)
+        self._wake.start()
+        self._refresh_hint()
+        self._wake_after = self.root.after(100, self._poll_wake)
+
+    def disable_wake_word(self) -> None:
+        if self._wake is not None:
+            self._wake.stop()
+            self._wake = None
+        if self._wake_after is not None:
+            try:
+                self.root.after_cancel(self._wake_after)
+            except tk.TclError:
+                pass
+            self._wake_after = None
+        self._refresh_hint()
+
+    def _set_wake_word(self, enabled: bool) -> str:
+        if self.voice is None:
+            return "La voz no está instalada, señor; no puedo escuchar «Hey Jarvis»."
+        if self.preferences is not None:
+            self.preferences.set_setting(WAKE_SETTING, "1" if enabled else "0")
+        if enabled:
+            self.enable_wake_word(self._wake_folder)
+            return "Como desee, señor. Le escucharé cuando diga «Hey Jarvis»."
+        self.disable_wake_word()
+        return "Entendido, señor. Dejo de escuchar «Hey Jarvis»; puede llamarme con AltGr+K."
+
+    def _poll_wake(self) -> None:
+        self._wake_after = None
+        if self._wake is None or self._closing:
+            return
+        if self._wake_heard.is_set():
+            self._wake_heard.clear()
+            if self._listen is None and self._task is None and self._approval is None:
+                _wake_chime()
+                self.listen_from_hotkey()
+        if self._wake.error and self.hint["text"] != f"«Hey Jarvis» no disponible: {self._wake.error}":
+            self.hint.configure(text=f"«Hey Jarvis» no disponible: {self._wake.error}")
+        self._wake_after = self.root.after(100, self._poll_wake)
+
+    def _refresh_hint(self) -> None:
+        wake = "Di «Hey Jarvis», " if self._wake is not None else ""
+        self.hint.configure(
+            text=f"{wake}{LISTEN_HOTKEY_LABEL} o Tab para hablar · {HOTKEY_LABEL} escribir · "
+                 "Enter ejecutar · Esc ocultar · ↑↓ historial"
+        )
+
     # --- tareas -------------------------------------------------------------------------
 
     def submit(self) -> None:
@@ -654,6 +728,15 @@ class DesktopWindow:
             return
         if normalize(text) == "salir":
             self.close()
+            return
+        toggle = WAKE_COMMANDS.get(normalize(text).strip(" .¿?¡!"))
+        if toggle is not None:
+            self.command.set("")
+            message = self._set_wake_word(toggle)
+            self.status.set("Completado")
+            self._set_output(message)
+            if self.speak_enabled and self.voice is not None:
+                self.voice.say(message)
             return
         if self.voice is not None:
             self.voice.stop_speaking()
@@ -740,6 +823,7 @@ class DesktopWindow:
             self.voice.say(result.message)
 
     def _destroy(self) -> None:
+        self.disable_wake_word()
         self.cancel_listening()
         if self.voice is not None:
             self.voice.stop_speaking()
@@ -761,6 +845,16 @@ class DesktopWindow:
             self.cancel()
 
 
+def _wake_chime() -> None:
+    """Pitido breve para saber que JARVIS oyó «Hey Jarvis» aunque la barra no esté a la vista."""
+    try:
+        import winsound
+
+        winsound.Beep(988, 90)
+    except (ImportError, RuntimeError):
+        pass
+
+
 def _warm_up(brain) -> None:
     try:
         brain.warm_up()
@@ -776,7 +870,7 @@ def _enable_dpi_awareness() -> None:
 
 
 def run_window(tools: LocalTools, audit: Audit, brain=None, *, start_hidden: bool = False,
-               voice=None, preferences=None) -> int:
+               voice=None, preferences=None, wake_folder=None) -> int:
     _enable_dpi_awareness()
     try:
         root = tk.Tk()
@@ -788,6 +882,7 @@ def run_window(tools: LocalTools, audit: Audit, brain=None, *, start_hidden: boo
     window.hide_on_blur = True
     window.enable_tray()
     window.enable_hotkey()
+    window.enable_wake_word(wake_folder)
     if start_hidden and window._can_hide:
         if brain is not None and hasattr(brain, "warm_up"):
             Thread(target=_warm_up, args=(brain,), daemon=True).start()

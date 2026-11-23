@@ -75,6 +75,9 @@ def main(argv: list[str] | None = None, *, audit_path: Path | None = None) -> in
     parser.add_argument("--sin-ia", action="store_true", help="Usa solo órdenes fijas, sin IA.")
     parser.add_argument("--sin-voz", action="store_true", help="Desactiva el micrófono y la voz.")
     parser.add_argument(
+        "--sin-activacion", action="store_true", help="No escucha «Hey Jarvis» en segundo plano.",
+    )
+    parser.add_argument(
         "--oculto", action="store_true",
         help="Con --ventana, arranca oculto en la bandeja. Muéstralo con AltGr+J.",
     )
@@ -123,7 +126,9 @@ def _run_mode(
         except ImportError:
             print("La ventana requiere una instalación de Python con Tkinter.")
             return 1
-        return run_window(tools, audit, brain, start_hidden=args.oculto, voice=voice, preferences=memory)
+        wake_folder = None if args.sin_activacion else Path(audit.path).parent / "modelos"
+        return run_window(tools, audit, brain, start_hidden=args.oculto, voice=voice, preferences=memory,
+                          wake_folder=wake_folder)
 
     if args.orden is not None:
         result = _run_console_command(args.orden, tools, audit, brain)
