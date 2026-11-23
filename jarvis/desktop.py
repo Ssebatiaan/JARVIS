@@ -714,6 +714,7 @@ class DesktopWindow:
             self.root.after(30, self._poll_listen)
             return
         self._listen = None
+        self._diag(f"escucha terminó: tipo={kind} oyó_texto={bool(value)} cancelada={listen.cancelled}")
         if self._wake is not None:
             self._wake.resume()
         self.orb.level = 0.0
@@ -787,16 +788,24 @@ class DesktopWindow:
                 "baja": "solo me activaré si lo dice con claridad"}[level]
         return f"Muy bien, señor: sensibilidad {level}; {hint}."
 
+    def _diag(self, message: str) -> None:
+        from .wake import diagnose
+
+        diagnose(self._wake_folder, message)
+
     def _poll_wake(self) -> None:
         self._wake_after = None
         if self._wake is None or self._closing:
             return
         if self._wake_heard.is_set():
             self._wake_heard.clear()
-            if (self._listen is None and self._task is None and self._approval is None
-                    and self._enrollment is None):
+            busy = {"escuchando": self._listen is not None, "tarea": self._task is not None,
+                    "aprobacion": self._approval is not None, "entrenando": self._enrollment is not None}
+            self._diag(f"barra recibió la activación; estado={self.root.state()} ocupado={busy}")
+            if not any(busy.values()):
                 _wake_chime()
                 self.listen_from_hotkey()
+                self._diag(f"escucha iniciada={self._listen is not None}; estado={self.root.state()}")
         if self._wake.error and self.hint["text"] != f"«Hey Jarvis» no disponible: {self._wake.error}":
             self.hint.configure(text=f"«Hey Jarvis» no disponible: {self._wake.error}")
         self._wake_after = self.root.after(100, self._poll_wake)

@@ -10,6 +10,7 @@ Todo el audio se procesa en memoria y en el propio PC; no se graba ni se envía 
 """
 
 import hashlib
+import os
 import threading
 import urllib.request
 from collections import deque
@@ -198,14 +199,6 @@ class WakeWordListener:
         self.personal = verifier is not None
         return verifier
 
-    def _detected(self, model, chunk, verifier) -> bool:
-        base = model.score(chunk)
-        if verifier is None:
-            return base >= self.threshold
-        if model._predictions <= WARMUP_PREDICTIONS:
-            return False
-        return verifier.probability(model.window()) >= verifier.threshold
-
     def _run(self) -> None:
         try:
             model = self._model_factory(ensure_models(self._folder))
@@ -213,7 +206,12 @@ class WakeWordListener:
             self.error = str(error) or "No pude cargar la palabra de activación."
             return
         verifier = self._load_verifier()
+        diagnose(self._folder, f"detector iniciado; verificador_personal={verifier is not None}")
         last_wake = -REFRACTORY_SECONDS
+        stats = {"since": monotonic(), "chunks": 0, "level": 0.0, "best": 0.0}
+        # Solo para diagnóstico: JARVIS_SIMULAR_ACTIVACION=segundos simula un «Hey Jarvis» periódico.
+        simulate = float(os.environ.get("JARVIS_SIMULAR_ACTIVACION", "0") or 0)
+        simulated_at = monotonic()
         while not self._stop.is_set():
             if self._paused.is_set():
                 self._stop.wait(0.1)
@@ -225,16 +223,68 @@ class WakeWordListener:
                     if self._reload.is_set():
                         self._reload.clear()
                         verifier = self._load_verifier()
-                    if self._detected(model, chunk, verifier) and monotonic() - last_wake >= REFRACTORY_SECONDS:
+                    detected, value = self._evaluate(model, chunk, verifier)
+                    self._account(stats, chunk, value)
+                    fake = simulate > 0 and monotonic() - simulated_at >= simulate
+                    if fake:
+                        simulated_at = monotonic()
+                    if (detected or fake) and monotonic() - last_wake >= REFRACTORY_SECONDS:
+                        diagnose(self._folder, f"ACTIVACION{' simulada' if fake else ''} puntaje={value:.3f}")
                         last_wake = monotonic()
                         model.reset()
                         self._on_wake()
             except WakeWordUnavailable as error:
                 self.error = str(error)
+                diagnose(self._folder, f"error del micrófono: {error}")
                 self._stop.wait(2)
-            except Exception:
+            except Exception as error:
+                diagnose(self._folder, f"error inesperado: {type(error).__name__}: {error}")
                 self._stop.wait(2)
             model.reset()
+
+    def _evaluate(self, model, chunk, verifier) -> tuple[bool, float]:
+        """(¿se activa?, puntaje): el del verificador personal si existe, si no el genérico."""
+        base = model.score(chunk)
+        if verifier is None:
+            return base >= self.threshold, base
+        if model._predictions <= WARMUP_PREDICTIONS:
+            return False, 0.0
+        probability = verifier.probability(model.window())
+        return probability >= verifier.threshold, probability
+
+    def _account(self, stats: dict, chunk, value: float) -> None:
+        """Una línea por minuto con bloques recibidos, nivel y mejor puntaje (nunca audio)."""
+        stats["chunks"] += 1
+        stats["best"] = max(stats["best"], value)
+        try:
+            stats["level"] = max(stats["level"], float(abs(chunk.astype("int32")).max()) / 32768)
+        except AttributeError:
+            pass
+        if monotonic() - stats["since"] >= DIAGNOSTIC_SECONDS:
+            diagnose(self._folder, f"minuto: bloques={stats['chunks']} nivel_max={stats['level']:.3f} "
+                                   f"mejor_puntaje={stats['best']:.3f}")
+            stats.update(since=monotonic(), chunks=0, level=0.0, best=0.0)
+
+
+DIAGNOSTIC_FILE = "diagnostico_activacion.log"
+DIAGNOSTIC_SECONDS = 60
+DIAGNOSTIC_MAX_BYTES = 200_000
+
+
+def diagnose(folder: Path | None, message: str) -> None:
+    """Registro de eventos de la activación por voz (sin audio). Rota al superar ~200 KB."""
+    if folder is None:
+        return
+    from datetime import datetime
+
+    try:
+        path = Path(os.environ.get("JARVIS_DIAGNOSTICO_ACTIVACION") or folder / DIAGNOSTIC_FILE)
+        if path.exists() and path.stat().st_size > DIAGNOSTIC_MAX_BYTES:
+            path.replace(path.with_suffix(".anterior.log"))
+        with open(path, "a", encoding="utf-8") as log:
+            log.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {message}\n")
+    except OSError:
+        pass
 
 
 # --- verificador personal --------------------------------------------------------------------

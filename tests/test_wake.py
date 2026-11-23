@@ -1,3 +1,8 @@
+import os as _os
+import tempfile as _tempfile
+
+# El registro de diagnóstico de las pruebas va a una carpeta temporal, no al proyecto.
+_os.environ["JARVIS_DIAGNOSTICO_ACTIVACION"] = _os.path.join(_tempfile.gettempdir(), "jarvis_pruebas_diagnostico.log")
 import hashlib
 import os
 import tempfile
