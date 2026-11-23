@@ -131,8 +131,10 @@ except ImportError:
 class FakeListener:
     instances = []
 
-    def __init__(self, folder, on_wake):
+    def __init__(self, folder, on_wake, on_clap=None):
         self.on_wake = on_wake
+        self.on_clap = on_clap
+        self.claps_enabled = on_clap is not None
         self.calls = []
         self.error = None
         FakeListener.instances.append(self)
@@ -237,6 +239,18 @@ class DesktopWakeTests(unittest.TestCase):
         self.window.disable_wake_word()
         self.window.enable_wake_word(Path("."))
         self.assertEqual(FakeListener.instances[-1].threshold, 0.15)
+
+    def test_two_claps_wake_jarvis_and_can_be_turned_off(self):
+        self.window.enable_wake_word(Path("."))
+        listener = FakeListener.instances[0]
+        self.assertTrue(listener.claps_enabled)
+        listener.on_clap()
+        self.wait_until(lambda: self.voice.listen.called and self.window._listen is None)
+        self.chime.assert_called_once_with()
+        self.window.command.set("desactiva las palmadas")
+        self.window.submit()
+        self.assertFalse(listener.claps_enabled)
+        self.assertEqual(self.preferences["voz.palmadas"], "0")
 
     def test_stays_off_when_disabled_or_without_voice(self):
         self.preferences["voz.activacion"] = "0"

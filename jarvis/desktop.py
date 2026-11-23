@@ -58,6 +58,11 @@ ENROLL_COMMANDS = {
     "aprende a reconocerme", "entrena mi voz",
 }
 FORGET_VOICE_COMMANDS = {"olvida mi voz", "borra mi voz"}
+CLAP_SETTING = "voz.palmadas"
+CLAP_COMMANDS = {
+    "activa las palmadas": True, "activa clap clap": True, "despiertate con palmadas": True,
+    "desactiva las palmadas": False, "desactiva clap clap": False, "no te despiertes con palmadas": False,
+}
 WAKE_COMMANDS = {
     "activa hey jarvis": True, "activa la palabra de activacion": True, "escuchame siempre": True,
     "desactiva hey jarvis": False, "desactiva la palabra de activacion": False,
@@ -281,6 +286,7 @@ class DesktopWindow:
         self.enroll_recorder = wake_module.record
         self.enroll_trainer = wake_module.train_personal_verifier
         self._wake_heard = Event()
+        self._clap_heard = Event()
         self._wake_after: str | None = None
         stored = preferences.get_setting(SPEECH_SETTING, "1") if preferences is not None else "1"
         self.speak_enabled = voice is not None and stored == "1"
@@ -794,7 +800,9 @@ class DesktopWindow:
         from .wake import SENSITIVITY, WakeWordListener
 
         level = self.preferences.get_setting(SENSITIVITY_SETTING, "normal") if self.preferences else "normal"
-        self._wake = WakeWordListener(folder, self._wake_heard.set)
+        self._wake = WakeWordListener(folder, self._wake_heard.set, on_clap=self._clap_heard.set)
+        claps = self.preferences.get_setting(CLAP_SETTING, "1") if self.preferences else "1"
+        self._wake.claps_enabled = claps == "1"
         self._wake.threshold = SENSITIVITY.get(level, SENSITIVITY["normal"])
         self._wake.start()
         self._refresh_hint()
@@ -840,6 +848,15 @@ class DesktopWindow:
 
         diagnose(self._wake_folder, message)
 
+    def _set_claps(self, enabled: bool) -> str:
+        if self.preferences is not None:
+            self.preferences.set_setting(CLAP_SETTING, "1" if enabled else "0")
+        if self._wake is not None:
+            self._wake.claps_enabled = enabled
+        if enabled:
+            return "Como desee, señor. Dos palmadas y estaré a su servicio."
+        return "Entendido, señor. Ya no responderé a las palmadas."
+
     def set_voice_speed(self, change) -> str:
         """``change``: un nivel («rápida»…) o +1/-1 para subir o bajar un paso."""
         if self.voice is None:
@@ -862,6 +879,10 @@ class DesktopWindow:
         self._wake_after = None
         if self._wake is None or self._closing:
             return
+        if self._clap_heard.is_set():
+            self._clap_heard.clear()
+            self._diag("palmadas recibidas por la barra")
+            self._wake_heard.set()  # «clap clap» despierta igual que «Hey Jarvis»
         if self._wake_heard.is_set():
             self._wake_heard.clear()
             busy = {"escuchando": self._listen is not None, "tarea": self._task is not None,
@@ -996,6 +1017,15 @@ class DesktopWindow:
             message = self._forget_voice()
             self.status.set("Completado")
             self._set_output(message)
+            return
+        clap_toggle = CLAP_COMMANDS.get(spoken)
+        if clap_toggle is not None:
+            self.command.set("")
+            message = self._set_claps(clap_toggle)
+            self.status.set("Completado")
+            self._set_output(message)
+            if self.speak_enabled and self.voice is not None:
+                self.voice.say(message)
             return
         toggle = WAKE_COMMANDS.get(spoken)
         level = SENSITIVITY_COMMANDS.get(spoken)

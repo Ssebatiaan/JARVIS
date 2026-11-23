@@ -150,7 +150,7 @@ class WakeWordListener:
     def __init__(self, folder: Path, on_wake: Callable[[], None], *,
                  model_factory: Callable[[Path], WakeWordModel] = WakeWordModel,
                  chunks: Callable[[threading.Event], Iterator] = microphone_chunks,
-                 threshold: float = THRESHOLD):
+                 threshold: float = THRESHOLD, on_clap: Callable[[], None] | None = None):
         self._folder = folder
         self._on_wake = on_wake
         self._model_factory = model_factory
@@ -162,6 +162,8 @@ class WakeWordListener:
         self._thread: threading.Thread | None = None
         self.error: str | None = None
         self.personal = False  # True cuando usa el verificador entrenado con la voz del usuario
+        self._on_clap = on_clap
+        self.claps_enabled = on_clap is not None  # «clap clap» en el mismo audio
 
     @property
     def running(self) -> bool:
@@ -208,7 +210,12 @@ class WakeWordListener:
         verifier = self._load_verifier()
         diagnose(self._folder, f"detector iniciado; verificador_personal={verifier is not None}")
         last_wake = -REFRACTORY_SECONDS
-        stats = {"since": monotonic(), "chunks": 0, "level": 0.0, "best": 0.0}
+        stats = {"since": monotonic(), "chunks": 0, "level": 0.0, "best": 0.0, "claps": 0}
+        claps = None
+        if self._on_clap is not None:
+            from .clap import ClapDetector
+
+            claps = ClapDetector()
         # Solo para diagnóstico: JARVIS_SIMULAR_ACTIVACION=segundos simula un «Hey Jarvis» periódico.
         simulate = float(os.environ.get("JARVIS_SIMULAR_ACTIVACION", "0") or 0)
         simulated_at = monotonic()
@@ -224,6 +231,16 @@ class WakeWordListener:
                         self._reload.clear()
                         verifier = self._load_verifier()
                     detected, value = self._evaluate(model, chunk, verifier)
+                    if claps is not None and self.claps_enabled:
+                        candidate = claps.last_candidate
+                        if claps.feed(chunk) and monotonic() - last_wake >= REFRACTORY_SECONDS:
+                            diagnose(self._folder, f"PALMADAS pico={claps.last_candidate.peak:.3f}")
+                            last_wake = monotonic()
+                            claps.reset()
+                            self._on_clap()
+                            continue
+                        if claps.last_candidate is not candidate:
+                            stats["claps"] += 1
                     self._account(stats, chunk, value)
                     fake = simulate > 0 and monotonic() - simulated_at >= simulate
                     if fake:
@@ -262,8 +279,8 @@ class WakeWordListener:
             pass
         if monotonic() - stats["since"] >= DIAGNOSTIC_SECONDS:
             diagnose(self._folder, f"minuto: bloques={stats['chunks']} nivel_max={stats['level']:.3f} "
-                                   f"mejor_puntaje={stats['best']:.3f}")
-            stats.update(since=monotonic(), chunks=0, level=0.0, best=0.0)
+                                   f"mejor_puntaje={stats['best']:.3f} golpes_sueltos={stats['claps']}")
+            stats.update(since=monotonic(), chunks=0, level=0.0, best=0.0, claps=0)
 
 
 DIAGNOSTIC_FILE = "diagnostico_activacion.log"
