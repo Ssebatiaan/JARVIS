@@ -22,7 +22,22 @@ VOCABULARY = (
     "lista procesos, abre la carpeta del proyecto, recuerda que, qué recuerdas, olvida."
 )
 VOICE = "es-MX-JorgeNeural"
-VOICE_RATE = "-6%"
+# Velocidad de la voz (el usuario la encontraba muy pausada a -6 %). Se cambia con la voz.
+SPEEDS = {"lenta": "-5%", "normal": "+10%", "rápida": "+20%", "muy rápida": "+30%"}
+SPEED_ORDER = ("lenta", "normal", "rápida", "muy rápida")
+DEFAULT_SPEED = "normal"
+_current_rate = [SPEEDS[DEFAULT_SPEED]]
+
+
+def set_speed(name: str) -> str:
+    """Cambia la velocidad de la voz para las próximas frases y devuelve el nivel aplicado."""
+    name = name if name in SPEEDS else DEFAULT_SPEED
+    _current_rate[0] = SPEEDS[name]
+    return name
+
+
+def voice_rate() -> str:
+    return _current_rate[0]
 VOICE_PITCH = "-6Hz"
 IDLE_UNLOAD_SECONDS = 300
 MAX_RECORD_SECONDS = 15.0
@@ -328,7 +343,7 @@ class NeuralStream:
                     try:
                         socket = await self._connection()
                         self._last_used = monotonic()
-                        config = TTSConfig(VOICE, VOICE_RATE, "+0%", VOICE_PITCH, "SentenceBoundary")
+                        config = TTSConfig(VOICE, voice_rate(), "+0%", VOICE_PITCH, "SentenceBoundary")
                         await socket.send_str(protocol.ssml_headers_plus_data(
                             protocol.connect_id(), protocol.date_to_string(),
                             protocol.mkssml(config, protocol.escape(text)),
@@ -403,7 +418,7 @@ class OneShotNeural:
 
         async def collect() -> bytes:
             data = bytearray()
-            async for chunk in edge_tts.Communicate(text, VOICE, rate=VOICE_RATE, pitch=VOICE_PITCH).stream():
+            async for chunk in edge_tts.Communicate(text, VOICE, rate=voice_rate(), pitch=VOICE_PITCH).stream():
                 if chunk["type"] == "audio":
                     data.extend(chunk["data"])
             return bytes(data)

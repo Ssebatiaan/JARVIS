@@ -432,6 +432,10 @@ class OrbWindow:
                                      check(name, self.theme_name)) for name in THEMES]),
                 ("Opacidad", "", [(name, "", lambda n=name: self.set_opacity(n),
                                          check(name, self.opacity_name)) for name in OPACITIES]),
+                ("Velocidad de voz", "", [(name.capitalize(), "",
+                                                 lambda n=name: self.window.run_quick(f"velocidad {n}"),
+                                                 check(name, getattr(self.window, "speed", "")))
+                                                for name in ("lenta", "normal", "rápida", "muy rápida")]),
                 ("Siempre en primer plano", "", self.toggle_topmost, self.topmost),
                 ("Aprender mi voz", "", lambda: run("aprende mi voz")),
             ]),

@@ -305,3 +305,49 @@ class DesktopVoiceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(os.name == "nt" and tk is not None, "Requiere Windows con Tkinter")
+class VoiceSpeedTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        try:
+            self.root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest(f"Sesión gráfica no disponible: {error}")
+        self.root.withdraw()
+        self.addCleanup(release_tk, self)
+        self.preferences = FakePreferences()
+        self.voice = FakeVoice(None)
+        self.window = DesktopWindow(self.root, Mock(spec=LocalTools), Audit(Path(temporary.name) / "a.sqlite3"),
+                                    voice=self.voice, preferences=self.preferences)
+        self.addCleanup(self.close)
+        from jarvis import voice as voice_module
+
+        self.addCleanup(voice_module.set_speed, voice_module.DEFAULT_SPEED)
+
+    def close(self):
+        try:
+            self.window.close()
+        except (AttributeError, tk.TclError):
+            pass
+
+    def say(self, text):
+        self.window.command.set(text)
+        self.window.submit()
+        return self.window.output.get("1.0", "end").strip()
+
+    def test_faster_slower_and_named_levels_change_the_real_rate_and_are_remembered(self):
+        from jarvis.voice import voice_rate
+
+        self.assertEqual(voice_rate(), "+10%")
+        self.assertIn("velocidad rápida", self.say("Jarvis, habla más rápido"))
+        self.assertEqual((voice_rate(), self.preferences.values["voz.velocidad"]), ("+20%", "rápida"))
+        self.say("velocidad muy rápida")
+        self.assertIn("tan rápido como puedo", self.say("habla más rápido"))
+        self.say("habla más despacio")
+        self.assertEqual(voice_rate(), "+20%")
+        self.say("velocidad lenta")
+        self.assertEqual(voice_rate(), "-5%")
+        self.assertEqual(self.voice.said[-1], "Entendido, señor. Hablaré a velocidad lenta.")

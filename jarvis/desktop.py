@@ -38,6 +38,14 @@ FONT = "Segoe UI"
 ICON_SEND, ICON_MIC, ICON_STOP = "\ue724", "\ue720", "\ue71a"
 ICON_VOLUME, ICON_MUTE, ICON_HIDE = "\ue767", "\ue74f", "\ue921"
 SPEECH_SETTING = "voz.respuestas"
+SPEED_SETTING = "voz.velocidad"
+SPEED_COMMANDS = {
+    "habla mas rapido": +1, "mas rapido": +1, "acelera la voz": +1, "habla un poco mas rapido": +1,
+    "habla mas despacio": -1, "habla mas lento": -1, "mas despacio": -1, "mas lento": -1,
+    "habla un poco mas despacio": -1,
+    "velocidad lenta": "lenta", "velocidad normal": "normal", "velocidad rapida": "rápida",
+    "velocidad muy rapida": "muy rápida",
+}
 DISMISS_MAX_WAIT = 8.0
 WAKE_SETTING = "voz.activacion"
 SENSITIVITY_SETTING = "voz.sensibilidad"
@@ -273,6 +281,10 @@ class DesktopWindow:
         self._wake_after: str | None = None
         stored = preferences.get_setting(SPEECH_SETTING, "1") if preferences is not None else "1"
         self.speak_enabled = voice is not None and stored == "1"
+        self.speed = DEFAULT_VOICE_SPEED
+        if voice is not None:
+            saved = preferences.get_setting(SPEED_SETTING, DEFAULT_VOICE_SPEED) if preferences is not None else None
+            self.speed = _apply_speed(saved or DEFAULT_VOICE_SPEED)
         self.hide_on_blur = False
         self._task: _Task | None = None
         self._approval: _Approval | None = None
@@ -813,6 +825,24 @@ class DesktopWindow:
 
         diagnose(self._wake_folder, message)
 
+    def set_voice_speed(self, change) -> str:
+        """``change``: un nivel («rápida»…) o +1/-1 para subir o bajar un paso."""
+        if self.voice is None:
+            return "La voz no está instalada, señor."
+        from .voice import SPEED_ORDER
+
+        if isinstance(change, int):
+            index = SPEED_ORDER.index(self.speed) if self.speed in SPEED_ORDER else 1
+            limit = index + change
+            if not 0 <= limit < len(SPEED_ORDER):
+                return ("Ya hablo tan rápido como puedo, señor." if change > 0
+                        else "Ya hablo tan despacio como puedo, señor.")
+            change = SPEED_ORDER[limit]
+        self.speed = _apply_speed(change)
+        if self.preferences is not None:
+            self.preferences.set_setting(SPEED_SETTING, self.speed)
+        return f"Entendido, señor. Hablaré a velocidad {self.speed}."
+
     def _poll_wake(self) -> None:
         self._wake_after = None
         if self._wake is None or self._closing:
@@ -930,6 +960,15 @@ class DesktopWindow:
             self.close()
             return
         spoken = normalize(text).strip(" .¿?¡!")
+        speed = SPEED_COMMANDS.get(" ".join(word for word in spoken.replace(",", " ").split() if word != "jarvis"))
+        if speed is not None:
+            self.command.set("")
+            message = self.set_voice_speed(speed)
+            self.status.set("Completado")
+            self._set_output(message)
+            if self.speak_enabled and self.voice is not None:
+                self.voice.say(message)
+            return
         if spoken in ENROLL_COMMANDS:
             self.command.set("")
             problem = self.start_enrollment()
@@ -1081,6 +1120,17 @@ class DesktopWindow:
             self._destroy()
         else:
             self.cancel()
+
+
+DEFAULT_VOICE_SPEED = "normal"
+
+
+def _apply_speed(name: str) -> str:
+    try:
+        from .voice import set_speed
+    except ImportError:
+        return name
+    return set_speed(name)
 
 
 def _wake_chime() -> None:
