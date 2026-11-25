@@ -32,6 +32,7 @@ SITES = {
     "x": ("X", "https://x.com/"),
     "twitter": ("X", "https://x.com/"),
     "reddit": ("Reddit", "https://www.reddit.com/"),
+    "outlook": ("Outlook", "https://outlook.office.com/mail/"),
     "savio": ("SAVIO", "https://savio.utb.edu.co/my/courses.php"),
 }
 SEARCH_ENGINES = {

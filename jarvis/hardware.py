@@ -58,6 +58,42 @@ def read_gpu() -> GpuStatus | None:
         nvml.nvmlShutdown()
 
 
+class _CounterItem(ct.Structure):
+    _fields_ = [("name", wintypes.LPWSTR), ("status", wintypes.DWORD), ("padding", wintypes.DWORD),
+                ("value", ct.c_double)]
+
+
+def read_cpu_temperature() -> float | None:
+    """Grados del sensor térmico del equipo (ACPI), sin permisos de administrador.
+
+    Sigue a la CPU (68 → 99 °C con carga en el equipo del usuario) con unos 10 s de retraso.
+    """
+    try:
+        pdh = ct.WinDLL("pdh.dll")
+    except OSError:
+        return None
+    query, counter = ct.c_void_p(), ct.c_void_p()
+    if pdh.PdhOpenQueryW(None, None, ct.byref(query)) != 0:
+        return None
+    try:
+        path = "\\Thermal Zone Information(*)\\High Precision Temperature"
+        if pdh.PdhAddEnglishCounterW(query, path, None, ct.byref(counter)) != 0 or pdh.PdhCollectQueryData(query) != 0:
+            return None
+        size, count = wintypes.DWORD(0), wintypes.DWORD(0)
+        pdh.PdhGetFormattedCounterArrayW(counter, 0x200, ct.byref(size), ct.byref(count), None)  # 0x200 = double
+        if size.value == 0:
+            return None
+        buffer = (ct.c_byte * size.value)()
+        if pdh.PdhGetFormattedCounterArrayW(counter, 0x200, ct.byref(size), ct.byref(count), buffer) != 0:
+            return None
+        items = ct.cast(buffer, ct.POINTER(_CounterItem))
+        values = [items[i].value / 10 - 273.15 for i in range(count.value) if items[i].status == 0]
+        values = [value for value in values if 5 < value < 125]  # descarta sensores vacíos
+        return max(values) if values else None
+    finally:
+        pdh.PdhCloseQuery(query)
+
+
 class _MemoryCounters(ct.Structure):
     _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
                 ("PeakWorkingSetSize", ct.c_size_t), ("WorkingSetSize", ct.c_size_t)] + \

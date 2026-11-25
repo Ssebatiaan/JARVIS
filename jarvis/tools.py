@@ -12,7 +12,7 @@ from .text import normalize as normalize
 SITE_KEYS = (
     "youtube", "youtube music", "google", "gmail", "github", "whatsapp web", "netflix", "twitch",
     "chatgpt", "claude", "drive", "google drive", "maps", "google maps", "wikipedia", "instagram",
-    "x", "twitter", "reddit", "savio",
+    "x", "twitter", "reddit", "savio", "outlook",
 )
 SEARCH_ENGINE_KEYS = ("google", "youtube", "wikipedia")
 MEDIA_ACTIONS = ("play_pause", "next", "previous", "stop", "mute")
@@ -173,6 +173,7 @@ class LocalTools(Protocol):
     def forget_memory(self, memory_id: int) -> bool: ...
     def clear_memories(self) -> int: ...
     def read_gpu(self) -> GpuReading | None: ...
+    def read_cpu_temperature(self) -> float | None: ...
     def top_programs(self) -> list[ProgramUsage]: ...
     def add_reminder(self, text: str, due: datetime, kind: str) -> int: ...
     def list_reminders(self) -> list[Reminder]: ...
@@ -191,6 +192,8 @@ class LocalTools(Protocol):
     def weather(self, city: str, day: str) -> str: ...
     def get_city(self) -> str | None: ...
     def set_city(self, city: str) -> None: ...
+    def add_wish(self, text: str) -> None: ...
+    def list_wishes(self) -> list[str]: ...
 
 
 class ToolId(StrEnum):
@@ -232,6 +235,9 @@ class ToolId(StrEnum):
     WEATHER = "weather.read"
     SET_CITY = "weather.city"
     CALCULATE = "math.calc"
+    CPU_TEMPERATURE = "system.cpu_temperature"
+    ADD_WISH = "wishes.add"
+    LIST_WISHES = "wishes.list"
 
 
 class Permission(Enum):
@@ -273,6 +279,9 @@ class Permission(Enum):
     READ_WEATHER = "weather.read"
     SET_CITY = "weather.city"
     CALCULATE = "math.calc"
+    READ_CPU_TEMPERATURE = "system.cpu_temperature.read"
+    ADD_WISH = "wishes.write"
+    READ_WISHES = "wishes.read"
 
 
 DEFAULT_PERMISSIONS = frozenset({
@@ -314,6 +323,9 @@ DEFAULT_PERMISSIONS = frozenset({
     Permission.READ_WEATHER,
     Permission.SET_CITY,
     Permission.CALCULATE,
+    Permission.READ_CPU_TEMPERATURE,
+    Permission.ADD_WISH,
+    Permission.READ_WISHES,
 })
 
 MAX_MEMORY_TEXT = 300
@@ -383,7 +395,10 @@ def _open_app(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
     try:
         name = tools.launch_app(cast(str, arguments["app"]).strip())
     except LookupError as error:
-        return _not_found(error, "entre tus aplicaciones instaladas")
+        outcome = _not_found(error, "entre sus aplicaciones instaladas")
+        if not isinstance(error, TargetAmbiguous) and not getattr(error, "suggestions", []):
+            return ToolOutcome(outcome.code, outcome.status, f"{outcome.message} ¿Lo busco en internet?")
+        return outcome
     return ToolOutcome(0, "solicitada", f"Abriendo {name}.")
 
 
@@ -553,6 +568,29 @@ def _read_gpu(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
         f"{gpu.name}: {gpu.utilization} % de uso, {gpu.memory_used_mib / 1024:.1f} de "
         f"{gpu.memory_total_mib / 1024:.0f} GiB de VRAM y {gpu.temperature} °C."
     ))
+
+
+def _read_cpu_temperature(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
+    value = tools.read_cpu_temperature()
+    if value is None:
+        return ToolOutcome(2, "no_disponible", "Este equipo no publica su sensor térmico en Windows.")
+    note = " Está bastante caliente." if value >= 90 else ""
+    return ToolOutcome(0, "completada", f"El procesador ronda los {value:.0f} °C, según el sensor térmico del equipo.{note}")
+
+
+def _add_wish(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
+    tools.add_wish(" ".join(cast(str, arguments["text"]).split()))
+    return ToolOutcome(0, "completada", "")
+
+
+def _list_wishes(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
+    wishes = tools.list_wishes()
+    if not wishes:
+        return ToolOutcome(0, "completada", "No tengo nada pendiente por aprender.")
+    first = "; ".join(wishes[:4])
+    rest = "\nDetalle:\n" + "\n".join(f"- {wish}" for wish in wishes) if len(wishes) > 4 else ""
+    return ToolOutcome(0, "completada", f"Me gustaría aprender {len(wishes)} cosas: {first}.{rest}"
+                       if len(wishes) > 1 else f"Me gustaría aprender esto: {first}.")
 
 
 def _size(mib: float) -> str:
@@ -1107,6 +1145,26 @@ TOOLS: Mapping[ToolId, ToolSpec] = MappingProxyType({
             handler=_calculate,
             parameters=(ArgumentSpec("expression", str, pattern=r"[\d+\-*/().,%^ sqrt×÷]{1,120}"),),
             invalid_arguments="Solo puedo calcular con números y operaciones.",
+        ),
+        ToolSpec(
+            id=ToolId.CPU_TEMPERATURE,
+            permission=Permission.READ_CPU_TEMPERATURE,
+            error_target="leer la temperatura",
+            handler=_read_cpu_temperature,
+        ),
+        ToolSpec(
+            id=ToolId.ADD_WISH,
+            permission=Permission.ADD_WISH,
+            error_target="anotar lo que falta",
+            handler=_add_wish,
+            parameters=(ArgumentSpec("text", str, max_length=120),),
+            invalid_arguments="Indica en pocas palabras qué falta.",
+        ),
+        ToolSpec(
+            id=ToolId.LIST_WISHES,
+            permission=Permission.READ_WISHES,
+            error_target="leer lo que falta",
+            handler=_list_wishes,
         ),
     )
 })

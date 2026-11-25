@@ -36,6 +36,12 @@ class RoutingTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(route(text), expected)
 
+    def test_vague_orders_go_to_the_ai(self):
+        for text in ("cierra todas las pestañas de Opera menos YouTube", "abre la página de la UTB", "cierra todo"):
+            with self.subTest(text=text):
+                self.assertIsNone(route(text)[0])
+        self.assertEqual(route("abre outlook"), (ToolId.OPEN_SITE, {"site": "outlook"}))
+
     def test_apps_and_windows(self):
         cases = {
             "Jarvis abre Discord": (ToolId.OPEN_APP, {"app": "discord"}),
@@ -102,9 +108,9 @@ class ToolExecutionTests(unittest.TestCase):
         self.assertEqual(result.code, 2)
         self.assertIn("No encontré «spotify» entre las ventanas abiertas", result.message)
 
-    def test_every_tool_is_offered_to_the_ai_except_memory_saving(self):
+    def test_every_tool_is_offered_to_the_ai_except_the_ones_with_their_own_field(self):
         offered = {tool for tool, _, _ in TOOL_CATALOG}
-        self.assertEqual(offered, {tool.value for tool in TOOLS} - {ToolId.SAVE_MEMORY.value})
+        self.assertEqual(offered, {tool.value for tool in TOOLS} - {ToolId.SAVE_MEMORY.value, ToolId.ADD_WISH.value})
 
 
 class AppCatalogTests(unittest.TestCase):
@@ -177,7 +183,7 @@ class PersonaTests(unittest.TestCase):
         dressed = dress(ToolId.SYSTEM_METRICS, 0, message, rng=rng)
         self.assertTrue(dressed.endswith(message))
         self.assertIn("señor", dressed)
-        self.assertTrue(dress(ToolId.OPEN_APP, 2, "No encontré «x».").startswith("Me temo"))
+        self.assertTrue(dress(ToolId.OPEN_APP, 2, "No encontré «x».").startswith("Un detalle, señor."))
         self.assertEqual(dress(ToolId.SET_VOLUME, 2, "Acción rechazada por el usuario."),
                          "Como usted diga, señor. No haré cambios.")
         self.assertTrue(dress(None, 2, "Orden no reconocida.").startswith("Disculpe, señor"))

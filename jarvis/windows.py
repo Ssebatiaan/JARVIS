@@ -229,6 +229,11 @@ class WindowsTools:
             return None
         return GpuReading(gpu.name, gpu.utilization, gpu.memory_used_mib, gpu.memory_total_mib, gpu.temperature)
 
+    def read_cpu_temperature(self) -> float | None:
+        from .hardware import read_cpu_temperature
+
+        return read_cpu_temperature()
+
     def top_programs(self) -> list[ProgramUsage]:
         from .hardware import top_processes
 
@@ -311,6 +316,12 @@ class WindowsTools:
         from .weather import report
 
         return report(city, day)
+
+    def add_wish(self, text: str) -> None:
+        self._memory_store().add_wish(text)
+
+    def list_wishes(self) -> list[str]:
+        return self._memory_store().wishes()
 
     def get_city(self) -> str | None:
         return self._memory_store().get_setting(CITY_SETTING)

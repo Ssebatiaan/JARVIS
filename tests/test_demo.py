@@ -178,6 +178,7 @@ class DemoTests(unittest.TestCase):
             "cancela el apagado", "¿qué pendientes tengo esta semana?", "resumen del día", "anota comprar pan",
             "marca como hecha la tarea 1", "borra la tarea 1", "conecta un calendario", "qué calendarios tengo",
             "desconecta el calendario SAVIO", "qué clima hace", "mi ciudad es Medellín", "cuánto es 15 por 8",
+            "¿Me puede decir qué temperatura tiene mi CPU?", "qué te falta aprender",
         )
         for command in commands:
             with self.subTest(command=command):
@@ -186,7 +187,8 @@ class DemoTests(unittest.TestCase):
                 self.assertIn("Permiso insuficiente", result.message)
         self.assertEqual(self.tools.mock_calls, [])
         outcomes = [row[1:3] for row in self.audit_rows()][1::2]
-        self.assertCountEqual(outcomes, [(tool_id.value, "denegada") for tool_id in TOOLS])
+        # wishes.add no tiene frase propia: solo llega por el campo «missing» de la IA.
+        self.assertCountEqual(outcomes, [(tool_id.value, "denegada") for tool_id in TOOLS if tool_id is not ToolId.ADD_WISH])
 
     def test_read_permission_is_distinct_from_volume_write_permission(self):
         permissions = frozenset({Permission.READ_VOLUME})
@@ -507,6 +509,6 @@ class DemoTests(unittest.TestCase):
         with patch("builtins.input", side_effect=["abre C:/Windows/notepad.exe", "consulta CPU y RAM", "salir"]):
             with redirect_stdout(output):
                 self.assertEqual(main(["--sin-ia"], audit_path=self.path), 0)
-        self.assertIn("Me temo que no ha sido posible, señor", output.getvalue())
+        self.assertIn("Un detalle, señor", output.getvalue())
         self.assertIn("sin rutas", output.getvalue())
         self.assertIn("GiB", output.getvalue())

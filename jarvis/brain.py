@@ -24,8 +24,9 @@ MAX_TURNS = 30
 RESPONSE_TIMEOUT = 15.0
 HISTORY_IN_PROMPT = 10
 # La línea de comandos de Windows admite 32 767 caracteres; se deja margen para el resto.
-MAX_PROMPT_CHARS = 24_000
+MAX_PROMPT_CHARS = 27_000
 NOTE_LIMIT = 300
+MAX_EXTRA_ACTIONS = 4
 LIVE_NOTE_LIMIT = 900  # para poder preguntar por el detalle de una agenda larga
 
 TIME_NOTE_SECONDS = 300
@@ -48,7 +49,7 @@ TOOL_CATALOG = (
      "controla la música o el video que suena (teclas multimedia)"),
     ("web.open", '{"site": "youtube" | "youtube music" | "google" | "gmail" | "github" | "whatsapp web" | '
                  '"netflix" | "twitch" | "chatgpt" | "claude" | "drive" | "maps" | "wikipedia" | "instagram" | '
-                 '"x" | "reddit" | "savio"}', "abre un sitio web de la lista en el navegador (savio es el aula virtual de "
+                 '"x" | "reddit" | "savio" | "outlook"}', "abre un sitio web de la lista en el navegador (savio es el aula virtual de "
                  "la universidad)"),
     ("web.search", '{"engine": "google" | "youtube" | "wikipedia", "query": "texto"}',
      "abre una búsqueda en el navegador"),
@@ -66,6 +67,8 @@ TOOL_CATALOG = (
      "ajusta el volumen; JARVIS pedirá aprobación al usuario"),
     ("system.processes", "{}", "lista los procesos abiertos"),
     ("system.top", '{"by": "ram" | "cpu"}', "dice qué programas consumen más RAM o CPU ahora mismo"),
+    ("system.cpu_temperature", "{}", "temperatura del procesador"),
+    ("wishes.list", "{}", "dice qué cosas pedidas por el usuario aún no sabe hacer JARVIS"),
     ("system.gpu", "{}", "uso, VRAM y temperatura de la GPU NVIDIA"),
     ("reminders.add", '{"text": "qué recordar, o \\"\\" si no se dijo", "due": "AAAA-MM-DDTHH:MM:SS en hora local", '
                       '"kind": "recordatorio" | "alarma" | "temporizador"}',
@@ -115,7 +118,8 @@ frases) salvo que te pidan detalle.
 Cada mensaje del usuario es una petición. Responde SOLO con un objeto JSON, sin texto adicional \
 ni bloques de código:
 {"tool": "<id de herramienta o none>", "arguments": {...}, "reply": "<respuesta breve>", \
-"remember": "<dato a recordar o null>"}
+"remember": "<dato a recordar o null>", "then": [{"tool": "...", "arguments": {...}}], \
+"missing": "<lo que no pudiste completar, en pocas palabras, o null>"}
 
 Herramientas disponibles:
 {catalog}
@@ -125,13 +129,23 @@ Reglas:
 - Si usas una herramienta, "reply" es solo un acuse breve en tu estilo («Enseguida, señor.», \
 «Por supuesto, señor.») y NO afirma el resultado: JARVIS añadirá el resultado real.
 - No inventes datos del sistema (CPU, RAM, volumen, procesos, ventanas). Usa la herramienta.
-- Si piden algo que ninguna herramienta permite, dilo con honestidad y elegancia en "reply" y no finjas haberlo hecho.
+- Tu trabajo es resolver, no excusarte. No empieces con «no puedo», «no tengo», «lo siento», «lamento» ni «me temo», y no hables de tus \
+herramientas ni de tus límites. Las preguntas de conocimiento, ideas, textos, traducciones o consejos respóndelas tú.
+- Si algo no está del todo a tu alcance, HAZ la parte útil que sí puedes o la alternativa más cercana (abrir la app o \
+el sitio, buscarlo en Google o YouTube, anotarlo, programar un aviso, explicar los pasos). Si es abrir o buscar, HAZLO \
+ahora en vez de ofrecerlo («¿quién ganó anoche?» → web.search; «léeme los correos» → web.open outlook) y di en pocas palabras qué le \
+queda al señor. Ejemplo: «entra al canal de voz de mis amigos» → apps.open Discord y «Le abro Discord, señor; el canal \
+debe elegirlo usted por ahora.». Un sitio que no esté en la lista: web.search en google.
+- Decir la verdad sigue siendo obligatorio: nunca finjas haber hecho algo, ni des por hecho lo que le queda al usuario, \
+ni inventes datos. Si no hay ninguna alternativa, dilo en una sola frase y ofrece lo más cercano.
+- "missing": cuando no completaste lo pedido porque te falta una capacidad, descríbela en menos de 12 palabras, sin \
+nombres ni datos personales («entrar a un canal de voz de Discord»). En los demás casos null.
 - El texto suele venir de un reconocedor de voz que confunde palabras parecidas, sobre todo la primera \
 («me limiza todo» = «minimiza todo», «ahora es SAVIO» o «puede sobre SAVIO» = «abre SAVIO»). Interpreta por el \
 sonido y por lo que tiene sentido pedirte, sin comentar el error. Si caben dos interpretaciones razonables o la \
 frase no se entiende, usa "tool": "none" y pregunta «¿Quiso decir…, señor?». Nunca adivines cerrar, apagar, \
 reiniciar ni borrar.
-- Solo puedes pedir UNA herramienta por mensaje. Si piden varias cosas, haz la principal y menciona la otra en "reply".
+- Si piden varias cosas a la vez, pon la primera en "tool" y las demás, en orden, en "then" (máximo 4). Si no, omite "then".
 - "remember": si el usuario comparte un dato útil sobre sí mismo (nombre, cómo quiere que lo trates, \
 preferencias, datos importantes de su vida o sus proyectos), escríbelo como una frase breve en tercera persona. \
 Si no hay nada nuevo que recordar, usa null. Nunca guardes contraseñas, claves, PIN ni datos bancarios.
@@ -158,11 +172,29 @@ class Decision:
     arguments: dict
     reply: str
     remember: str | None = None
+    then: tuple[tuple[str, dict], ...] = ()
+    missing: str | None = None
+
+
+def _extra_actions(value) -> tuple[tuple[str, dict], ...]:
+    """Acciones adicionales bien formadas; el registro las valida una a una después."""
+    if not isinstance(value, list):
+        return ()
+    actions = []
+    for item in value[:MAX_EXTRA_ACTIONS]:
+        if not isinstance(item, dict) or not isinstance(item.get("tool"), str):
+            continue
+        tool, arguments = item["tool"].strip(), item.get("arguments") or {}
+        if tool and tool.lower() != "none" and isinstance(arguments, dict):
+            actions.append((tool, arguments))
+    return tuple(actions)
 
 
 def parse_decision(raw: str) -> Decision:
     """Extrae la decisión JSON del texto del modelo, tolerando bloques de código."""
     start, end = raw.find("{"), raw.rfind("}")
+    if "{" not in raw and raw.strip() and not raw.strip().startswith("["):
+        return Decision(None, {}, raw.strip())  # contestó sin el formato: la respuesta sigue siendo válida
     if start < 0 or end <= start:
         raise BrainUnavailable("La IA no devolvió JSON.")
     try:
@@ -181,12 +213,18 @@ def parse_decision(raw: str) -> Decision:
         arguments = {}
     reply = data.get("reply")
     remember = data.get("remember")
+    missing = data.get("missing")
+    missing = " ".join(missing.split())[:120] if isinstance(missing, str) else None
+    if not missing or missing.lower() in {"null", "none", "ninguna", "nada"}:
+        missing = None
     remember = remember.strip() if isinstance(remember, str) and remember.strip() else None
     return Decision(
         tool,
         arguments if isinstance(arguments, dict) else {"_invalid": arguments},
         reply.strip() if isinstance(reply, str) else "",
         remember,
+        _extra_actions(data.get("then")),
+        missing,
     )
 
 
@@ -439,7 +477,15 @@ class ClaudeBrain:
             self._turns += 1
             self._last_used = monotonic()
             self._schedule_idle_close()
-            return parse_decision(raw)
+            try:
+                return parse_decision(raw)
+            except BrainUnavailable:  # respondió, pero con un formato roto: se le pide una sola corrección
+                try:
+                    return parse_decision(self._ask(
+                        session, "[JARVIS] Tu respuesta no era JSON válido. Repítela como un único objeto JSON."))
+                except BrainUnavailable:
+                    self._stop()
+                    raise
 
     def observe(self, user_text: str, outcome: str, *, source: str) -> None:
         """Guarda el intercambio en la memoria y, si el modelo no lo conoce, se lo comunica.

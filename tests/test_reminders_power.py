@@ -120,6 +120,14 @@ class RoutingTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIsNone(route(text)[0])
 
+    def test_cpu_temperature_in_the_words_of_the_user(self):
+        for text in ("Me puede decir qué temperatura tiene mi CPU.", "¿Puedes decirme a qué temperatura esta mi CPU?",
+                     "temperatura del procesador", "¿qué tan caliente está la CPU?"):
+            with self.subTest(text=text):
+                self.assertEqual(route(text), (ToolId.CPU_TEMPERATURE, {}))
+        self.assertEqual(route("¿me puedes decir cuánto usa la GPU?"), (ToolId.GPU, {}))
+        self.assertIsNone(route("¿qué temperatura es peligrosa para una CPU?")[0])
+
     def test_reminder_commands(self):
         tool, arguments = route("Jarvis, recuérdame mañana a las 7 que tengo examen de Cálculo")
         self.assertIs(tool, ToolId.ADD_REMINDER)
@@ -162,6 +170,9 @@ class ToolTests(unittest.TestCase):
                          "RTX 3050: 7 % de uso, 0.5 de 4 GiB de VRAM y 45 °C.")
         self.tools.read_gpu.return_value = None
         self.assertEqual(self.run_text("temperatura de la GPU").code, 2)
+        self.tools.read_cpu_temperature.return_value = 67.4
+        self.assertEqual(self.run_text("temperatura de la CPU").message,
+                         "El procesador ronda los 67 °C, según el sensor térmico del equipo.")
         self.tools.top_programs.return_value = [
             ProgramUsage("opera", 29, 5084, 3.0), ProgramUsage("Code", 14, 2222, 9.5),
             ProgramUsage("Discord", 6, 850, 0.4),
@@ -260,6 +271,18 @@ class StoreTests(unittest.TestCase):
         self.store.take_due.assert_not_called()
         self.assertEqual([item.text for item in clock.due(now + timedelta(minutes=1))], ["ropa"])
         self.assertEqual(clock.due(now + timedelta(minutes=2)), [])
+
+
+class WishTests(unittest.TestCase):
+    def test_counts_orders_and_forgets(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        store = MemoryStore(Path(temporary.name) / "m.sqlite3")
+        for text in ("leer correos", "entrar a un canal de voz", "entrar a un canal de voz."):
+            store.add_wish(text)
+        self.assertEqual(store.wishes(), ["entrar a un canal de voz", "leer correos"])
+        store.forget_everything()
+        self.assertEqual(store.wishes(), [])
 
 
 class PowerTests(unittest.TestCase):

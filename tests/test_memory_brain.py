@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -93,7 +94,7 @@ class ParseDecisionTests(unittest.TestCase):
         self.assertEqual(decision, Decision(None, {}, "Hola", None))
 
     def test_invalid_answers_raise_brain_unavailable(self):
-        for raw in ("sin json", "{roto", "[1, 2]"):
+        for raw in ("", "{roto", "[1, 2]"):
             with self.subTest(raw=raw), self.assertRaises(BrainUnavailable):
                 parse_decision(raw)
 
@@ -216,8 +217,40 @@ class CoreWithBrainTests(unittest.TestCase):
         brain = FakeBrain(error=BrainUnavailable("caído"))
         result = run_command("hola", self.tools, self.audit, brain=brain)
         self.assertEqual(result.code, 1)
-        self.assertIn("no pude consultar a la IA", result.message)
+        self.assertEqual(result.message, "No pude consultar a la IA en este momento. ¿Me lo repite, por favor?")
         self.assertIn(("assistant.brain", "fallida"), self.actions())
+
+    def test_several_actions_run_in_order_and_each_one_is_validated(self):
+        self.tools.launch_app.return_value = "Discord"
+        brain = FakeBrain(Decision("apps.open", {"app": "Discord"}, "Enseguida, señor.", None, (
+            ("media.control", {"action": "play_pause"}), ("audio.set_volume", {"percent": 20}),
+            ("apps.open", {"app": "C:\\Windows\\cmd.exe"}), ("memory.save", {"text": "x"}))))
+        result = run_command("abre discord, pausa y baja el volumen", self.tools, self.audit, brain=brain, persona=True)
+        self.tools.launch_app.assert_called_once_with("Discord")  # la ruta se rechaza
+        self.tools.media_key.assert_called_once_with("play_pause")
+        self.tools.set_volume.assert_not_called()  # sigue pidiendo aprobación
+        self.tools.save_memory.assert_not_called()
+        self.assertEqual(result.code, 2)
+        self.assertEqual(result.message.count("Enseguida, señor."), 1)
+
+    def test_what_it_could_not_do_is_written_down(self):
+        brain = FakeBrain(Decision(None, {}, "Le abro Discord, señor.", None, (), "entrar a un canal de voz"))
+        result = run_command("entra al canal", self.tools, self.audit, brain=brain)
+        self.tools.add_wish.assert_called_once_with("entrar a un canal de voz")
+        self.assertEqual(result.message, "Le abro Discord, señor.")
+        brain = FakeBrain(Decision(None, {}, "Ok", None, (), "leer la contraseña del banco"))
+        run_command("lee mi contraseña", self.tools, self.audit, brain=brain)
+        self.assertEqual(self.tools.add_wish.call_count, 1)
+
+    def test_replies_without_format_and_extra_fields(self):
+        self.assertEqual(parse_decision("Buenas noches, señor.").reply, "Buenas noches, señor.")
+        with self.assertRaises(BrainUnavailable):
+            parse_decision('{"tool": "none", "reply": ')
+        decision = parse_decision('{"tool":"apps.open","arguments":{"app":"x"},"reply":"","missing":"null","then":'
+                                  '[{"tool":"none"},{"tool":"media.control","arguments":{"action":"next"}},3,{"tool":7}]}')
+        self.assertEqual(decision.then, (("media.control", {"action": "next"}),))
+        self.assertIsNone(decision.missing)
+        self.assertEqual(len(parse_decision(json.dumps({"tool": "apps.open", "then": [{"tool": "system.time"}] * 9})).then), 4)
 
     def test_model_memories_are_saved_but_secrets_are_refused(self):
         self.tools.save_memory.return_value = 7
@@ -309,7 +342,9 @@ class ClaudeBrainProcessTests(unittest.TestCase):
         for index in range(50):
             self.memory.add_fact(f"dato {index} " + "z" * 280)
         prompt = self.brain()._system_prompt()
-        self.assertLessEqual(len(prompt), 24_000)
+        self.assertLessEqual(len(prompt), 27_000)
+        # Windows admite 32 767 caracteres por línea de órdenes, ya con las comillas escapadas.
+        self.assertLess(len(subprocess.list2cmdline(["x" * 400, prompt])), 32_000)
         self.assertIn("50. dato 49", prompt)
         self.assertIn("pregunta 19", prompt)
         self.assertNotIn("pregunta 10 ", prompt)

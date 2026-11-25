@@ -12,11 +12,12 @@ from .tools import ToolId
 
 REPORTS = {ToolId.SYSTEM_METRICS, ToolId.READ_VOLUME, ToolId.LIST_PROCESSES, ToolId.LIST_MEMORIES,
            ToolId.TIME, ToolId.GPU, ToolId.TOP_PROGRAMS, ToolId.LIST_REMINDERS, ToolId.AGENDA,
-           ToolId.DAY_SUMMARY, ToolId.LIST_CALENDARS, ToolId.WEATHER, ToolId.CALCULATE}
+           ToolId.DAY_SUMMARY, ToolId.LIST_CALENDARS, ToolId.WEATHER, ToolId.CALCULATE, ToolId.CPU_TEMPERATURE,
+           ToolId.LIST_WISHES}
 REPORT_OPENERS = ("Aquí tiene, señor.", "Con mucho gusto, señor.", "Enseguida, señor.")
 ACTION_OPENERS = ("Enseguida, señor.", "Por supuesto, señor.", "Ahora mismo, señor.", "Como desee, señor.")
-DENIED = "Me temo que no ha sido posible, señor."
-FAILED = "Lo lamento, señor, algo ha fallado."
+DENIED = "Un detalle, señor."
+FAILED = "Un contratiempo, señor."
 REJECTED = "Como usted diga, señor. No haré cambios."
 NOT_UNDERSTOOD = "Disculpe, señor, no he comprendido la orden."
 

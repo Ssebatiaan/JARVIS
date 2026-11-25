@@ -9,6 +9,7 @@ from .tools import MAX_MEMORY_TEXT, MAX_REMINDER_TEXT, MemoryFull, MemoryItem, R
 MAX_FACTS = 50
 MAX_PENDING_REMINDERS = 50
 MAX_OPEN_TASKS = 200
+MAX_WISHES = 50
 HISTORY_LIMIT = 20
 
 
@@ -43,6 +44,10 @@ class MemoryStore:
             "CREATE TABLE IF NOT EXISTS reminders ("
             "id INTEGER PRIMARY KEY, text TEXT NOT NULL, due TEXT NOT NULL, kind TEXT NOT NULL, "
             "created_at TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0)"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS wishes ("
+            "id INTEGER PRIMARY KEY, text TEXT NOT NULL UNIQUE, times INTEGER NOT NULL, last_at TEXT NOT NULL)"
         )
         connection.execute(
             "CREATE TABLE IF NOT EXISTS tasks ("
@@ -86,6 +91,7 @@ class MemoryStore:
         with closing(self._connect()) as connection, connection:
             removed = connection.execute("DELETE FROM facts").rowcount
             connection.execute("DELETE FROM history")
+            connection.execute("DELETE FROM wishes")
         return removed
 
     def add_exchange(self, user_text: str, reply: str) -> None:
@@ -198,3 +204,21 @@ class MemoryStore:
             return connection.execute(
                 "UPDATE tasks SET done = ? WHERE id = ? AND done = 0", (done, task_id)
             ).rowcount > 0
+
+    # --- lo que JARVIS aún no sabe hacer (para enseñárselo) --------------------------------
+
+    def add_wish(self, text: str) -> None:
+        text = " ".join(text.split()).rstrip(".")
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                "INSERT INTO wishes (text, times, last_at) VALUES (?, 1, ?) "
+                "ON CONFLICT(text) DO UPDATE SET times = times + 1, last_at = excluded.last_at", (text, self._now())
+            )
+            connection.execute(
+                "DELETE FROM wishes WHERE id NOT IN (SELECT id FROM wishes ORDER BY last_at DESC LIMIT ?)", (MAX_WISHES,)
+            )
+
+    def wishes(self) -> list[str]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute("SELECT text FROM wishes ORDER BY times DESC, last_at DESC").fetchall()
+        return [row[0] for row in rows]

@@ -100,6 +100,18 @@ GPU_PATTERN = re.compile(
     r"que tan (?:caliente|ocupada|cargada) esta|(?:(?:la|el) )?(?:temperatura|uso|estado|consumo) (?:de|del))?"
     r" ?(?:(?:la|mi) )?(?:gpu|grafica|tarjeta de video|tarjeta grafica|vram)" + _NOW
 )
+CPU_TEMPERATURE = re.compile(
+    r"^(?:(?:la )?temperatura (?:de |del )(?:la |el |mi )?|(?:a )?que temperatura (?:tiene|esta|hay en) (?:la |el |mi )?|"
+    r"que tan caliente esta (?:la |el |mi )?|como esta la temperatura (?:de |del )(?:la |el |mi )?|"
+    r"cual es la temperatura (?:de |del )(?:la |el |mi )?)(?:cpu|procesador)" + _NOW
+)
+# «¿me puede decir…?» pregunta lo mismo que «…».
+POLITE = re.compile(
+    r"^(?:por favor )?(?:me )?(?:puede|puedes|podria|podrias|quiero saber|quisiera saber)(?: por favor)?"
+    r"(?: (?:decirme|decir|mostrarme|mostrar|consultar))? "
+)
+WISH_COMMANDS = {"que no sabes hacer", "que te falta aprender", "que te falta", "que no pudiste hacer",
+                 "que no has podido hacer", "que te gustaria aprender"}
 TOP_PATTERN = re.compile(
     r"^(?:(?:dime|muestrame|muestra) )?(?:que|cual|cuales)\b.*\b(?:consume|consumen|consumiendo|usa|usan|usando|"
     r"gasta|gastan|gastando|come|comen|comiendo|chupa|chupando|ocupa|ocupan|ocupando)(?: (?:mas|tanta|tanto|mucha|"
@@ -305,9 +317,14 @@ def _route(command: str, original: str | None = None) -> RoutedCommand:
     for pattern, tool_id, action in POWER_PATTERNS:
         if pattern.match(command):
             return tool_id, ({"action": action} if action else {})
-    if GPU_PATTERN.match(command):
+    if command in WISH_COMMANDS:
+        return ToolId.LIST_WISHES, {}
+    asked_for = POLITE.sub("", command)
+    if CPU_TEMPERATURE.match(asked_for):
+        return ToolId.CPU_TEMPERATURE, {}
+    if GPU_PATTERN.match(asked_for):
         return ToolId.GPU, {}
-    top = TOP_PATTERN.match(command)
+    top = TOP_PATTERN.match(asked_for)
     if top:
         return ToolId.TOP_PROGRAMS, {"by": "cpu" if top["by"] in ("cpu", "procesador") else "ram"}
     if command in METRIC_COMMANDS:
@@ -345,7 +362,7 @@ def _route(command: str, original: str | None = None) -> RoutedCommand:
         if match:
             return ToolId.FOCUS_WINDOW, {"app": match[1]}
     match = CLOSE_PATTERN.fullmatch(command)
-    if match and " y " not in match[1]:
+    if match and not re.search(r" y |\b(?:tod[ao]s?|menos|excepto|pestanas?)\b", match[1]):
         return ToolId.CLOSE_WINDOW, {"app": match[1]}
 
     verb, _, argument = command.partition(" ")
@@ -356,7 +373,7 @@ def _route(command: str, original: str | None = None) -> RoutedCommand:
         site = site_key(argument)
         if site is not None:
             return ToolId.OPEN_SITE, {"site": site}
-        if " y " in argument:
+        if " y " in argument or re.search(r"\b(?:pagina|sitio|web|enlace)\b", argument):
             return None, {}  # órdenes compuestas: mejor que las interprete la IA
         return ToolId.OPEN_APP, {"app": argument}
     return None, {}
@@ -582,7 +599,7 @@ def _run_with_brain(
         decision = brain.decide(text)
     except BrainUnavailable:
         outcome = ToolOutcome(
-            1, "fallida", f"No reconocí la orden y no pude consultar a la IA en este momento. {HELP}"
+            1, "fallida", "No pude consultar a la IA en este momento. ¿Me lo repite, por favor?"
         )
         return _record_outcome(execution, BRAIN_ACTION, outcome, started)
     except KeyboardInterrupt:
@@ -596,16 +613,28 @@ def _run_with_brain(
     if decision.tool is None:
         messages.append(decision.reply or "No tengo una respuesta para eso.")
     else:
-        route = _route_from_model(decision.tool, decision.arguments)
-        step = _run_step(route, tools, execution)
-        _notify_memory(brain, route, step)
-        if persona and decision.reply and step.code == 0 and route[0] is not ToolId.DISMISS:
-            messages.append(f"{decision.reply} {step.message}")
-        elif persona:
-            messages.append(jarvis_persona.dress(route[0], step.code, step.message))  # la despedida va sola
-        else:
-            messages.append(step.message)
-        code, source = step.code, "tool"
+        source = "tool"
+        for index, (tool, arguments) in enumerate(((decision.tool, decision.arguments), *decision.then)):
+            if index and execution.cancelled():
+                code = code or 130
+                break
+            route = _route_from_model(tool, arguments)
+            if index and route[0] in (ToolId.ADD_WISH, ToolId.SAVE_MEMORY):
+                continue  # solo por sus campos propios, que filtran lo sensible
+            step = _run_step(route, tools, execution)
+            _notify_memory(brain, route, step)
+            if index:
+                messages.append(step.message)  # el saludo va una sola vez
+            elif persona and decision.reply and step.code == 0 and route[0] is not ToolId.DISMISS:
+                messages.append(f"{decision.reply} {step.message}")
+            elif persona:
+                messages.append(jarvis_persona.dress(route[0], step.code, step.message))  # la despedida va sola
+            else:
+                messages.append(step.message)
+            code = code or step.code
+
+    if decision.missing and not SENSITIVE_PATTERN.search(normalize(decision.missing)):
+        _run_step((ToolId.ADD_WISH, {"text": decision.missing}), tools, execution)
 
     if decision.remember:
         if SENSITIVE_PATTERN.search(normalize(decision.remember)):
