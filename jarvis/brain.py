@@ -47,7 +47,8 @@ TOOL_CATALOG = (
      "controla la música o el video que suena (teclas multimedia)"),
     ("web.open", '{"site": "youtube" | "youtube music" | "google" | "gmail" | "github" | "whatsapp web" | '
                  '"netflix" | "twitch" | "chatgpt" | "claude" | "drive" | "maps" | "wikipedia" | "instagram" | '
-                 '"x" | "reddit"}', "abre un sitio web de la lista en el navegador"),
+                 '"x" | "reddit" | "savio"}', "abre un sitio web de la lista en el navegador (savio es el aula virtual de "
+                 "la universidad)"),
     ("web.search", '{"engine": "google" | "youtube" | "wikipedia", "query": "texto"}',
      "abre una búsqueda en el navegador"),
     ("youtube.play", '{"query": "canción o video"}',

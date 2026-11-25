@@ -12,7 +12,7 @@ from .text import normalize as normalize
 SITE_KEYS = (
     "youtube", "youtube music", "google", "gmail", "github", "whatsapp web", "netflix", "twitch",
     "chatgpt", "claude", "drive", "google drive", "maps", "google maps", "wikipedia", "instagram",
-    "x", "twitter", "reddit",
+    "x", "twitter", "reddit", "savio",
 )
 SEARCH_ENGINE_KEYS = ("google", "youtube", "wikipedia")
 MEDIA_ACTIONS = ("play_pause", "next", "previous", "stop", "mute")

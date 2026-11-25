@@ -25,6 +25,7 @@ class RoutingTests(unittest.TestCase):
             "Jarvis, abre YouTube y reproduce Back in Black": (ToolId.PLAY_YOUTUBE, {"query": "Back in Black"}),
             "reproduce la canción Canción  del Mariachi en youtube": (ToolId.PLAY_YOUTUBE, {"query": "Canción  del Mariachi"}),
             "abre youtube": (ToolId.OPEN_SITE, {"site": "youtube"}),
+            "Jarvis, abre SAVIO": (ToolId.OPEN_SITE, {"site": "savio"}),
             "abre youtube y busca tutoriales de Python": (ToolId.WEB_SEARCH, {"engine": "youtube", "query": "tutoriales de Python"}),
             "busca recetas de arepas en Google": (ToolId.WEB_SEARCH, {"engine": "google", "query": "recetas de arepas"}),
             "pausa la música": (ToolId.MEDIA, {"action": "play_pause"}),

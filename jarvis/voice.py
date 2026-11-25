@@ -19,7 +19,8 @@ BLOCK_SECONDS = 0.1
 WHISPER_MODEL = "base"
 VOCABULARY = (
     "Jarvis, abre el Bloc de notas, consulta la CPU y la RAM, sube o baja el volumen, "
-    "lista procesos, abre la carpeta del proyecto, recuerda que, qué recuerdas, olvida."
+    "lista procesos, abre la carpeta del proyecto, recuerda que, qué recuerdas, olvida, "
+    "abre SAVIO."
 )
 VOICE = "es-MX-JorgeNeural"
 # Velocidad de la voz (el usuario la encontraba muy pausada a -6 %). Se cambia con la voz.
