@@ -89,20 +89,30 @@ FORGET_PATTERN = re.compile(r"olvida (?:el )?recuerdo (?:numero |n\.?o )?([0-9]{
 CLEAR_MEMORY_COMMANDS = {"olvida todo", "olvida todo lo que sabes de mi", "borra tu memoria"}
 MEMORY_MUTATIONS = {ToolId.SAVE_MEMORY, ToolId.FORGET_MEMORY, ToolId.CLEAR_MEMORIES}
 SENSITIVE_PATTERN = re.compile(r"contrasen|password|clave|\bpin\b|tarjeta|cvv|token|cuenta bancaria")
-_HARDWARE_QUESTION = r"^(?:cuanto|cuanta|que|como|cual|dime|consulta|muestra|muestrame|revisa|estado|uso|temperatura)\b"
-GPU_PATTERN = re.compile(_HARDWARE_QUESTION + r".*\b(?:gpu|grafica|tarjeta de video|tarjeta grafica|vram|nvidia)\b")
+_NOW = r"(?: (?:ahora|ahora mismo|en este momento|de mi pc|del pc|en uso|libre|disponible|tengo|uso))*$"
+# Solo preguntas sobre el estado actual: «qué es una GPU» o «cuánto cuesta» son para la IA.
+GPU_PATTERN = re.compile(
+    r"^(?:(?:dime|muestrame|muestra|consulta|revisa) )?(?:"
+    r"cuant[oa] (?:(?:se )?(?:esta )?(?:usa|usando|consume|consumiendo|gasta|gastando)|uso)(?: de)?|cuanta|"
+    r"como (?:esta|va|anda)|(?:a )?que (?:temperatura|uso)(?: (?:tiene|esta))?(?: de)?|"
+    r"que tan (?:caliente|ocupada|cargada) esta|(?:(?:la|el) )?(?:temperatura|uso|estado|consumo) (?:de|del))?"
+    r" ?(?:(?:la|mi) )?(?:gpu|grafica|tarjeta de video|tarjeta grafica|vram)" + _NOW
+)
 TOP_PATTERN = re.compile(
-    r"^(?:que|cual|cuales|dime|muestra|muestrame)\b.*\b(?:consum|usa\b|usando|gasta|come|comiendo|chupa|ocupa)\w*"
-    r".*\b(?P<by>ram|memoria|cpu|procesador)\b"
+    r"^(?:(?:dime|muestrame|muestra) )?(?:que|cual|cuales)\b.*\b(?:consume|consumen|consumiendo|usa|usan|usando|"
+    r"gasta|gastan|gastando|come|comen|comiendo|chupa|chupando|ocupa|ocupan|ocupando)(?: (?:mas|tanta|tanto|mucha|"
+    r"mucho|toda|todo|la|el|mi|de))* (?P<by>ram|memoria|cpu|procesador)" + _NOW
 )
 REMINDER_LIST_PATTERN = re.compile(
-    r"^(?:que|cuales|cuantos|mis|lista|listar|muestra|muestrame|dime|ver)\b.*\b(?:recordatorios?|alarmas?|"
-    r"temporizador(?:es)?|avisos?)\b(?: (?:pendientes|tengo|hay|programados?|activos?))*$"
+    r"^(?:(?:dime|muestra|muestrame|lista|listar|ver) )?(?:(?:que|cuales|cuantos|cuantas|son|hay|tengo|mis|los|las) )*"
+    r"(?:recordatorios|alarmas|temporizadores|avisos)(?: (?:pendientes|tengo|hay|programad[oa]s|activ[oa]s))*$"
     r"|^cuanto (?:le )?falta(?: (?:al|para el) temporizador| para (?:la alarma|el aviso|el recordatorio))?$"
 )
+# «apaga la alarma» suele decirse cuando ya sonó: no debe borrar la de mañana.
 REMINDER_CANCEL_PATTERN = re.compile(
-    r"^(?:cancela|cancelar|borra|elimina|quita|deten|para|apaga)(?: el| la| mi)? "
-    r"(?:recordatorio|alarma|temporizador|aviso)(?: (?:numero |n\.?o )?(?P<id>\d{1,9}))?$"
+    r"^(?:cancela|cancelar|borra|elimina|quita)(?: el| la| mi)? "
+    r"(?P<kind>recordatorio|alarma|temporizador|aviso)(?: (?:numero |n\.?o )?(?P<id>\d{1,9}))?$"
+    r"|^(?:deten|para|apaga)(?: el| mi)? (?P<timer>temporizador)$"
 )
 _PC = r"(?: (?:el|la|mi))? (?:pc|computador|computadora|equipo|ordenador|portatil|laptop|maquina)"
 POWER_PATTERNS = (
@@ -223,7 +233,9 @@ def _route(command: str, original: str | None = None) -> RoutedCommand:
         return ToolId.LIST_REMINDERS, {}
     cancel = REMINDER_CANCEL_PATTERN.match(command)
     if cancel:
-        return ToolId.CANCEL_REMINDER, {"reminder_id": int(cancel["id"] or 0)}
+        kind = cancel["kind"] or cancel["timer"]
+        return ToolId.CANCEL_REMINDER, {"reminder_id": int(cancel["id"] or 0),
+                                        "kind": "aviso" if cancel["id"] else kind}
     for pattern, tool_id, action in POWER_PATTERNS:
         if pattern.match(command):
             return tool_id, ({"action": action} if action else {})

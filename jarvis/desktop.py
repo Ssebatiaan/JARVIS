@@ -918,6 +918,7 @@ class DesktopWindow:
         self._reminders_after = None
         if self._closing or self._reminders is None:
             return
+        self._reminders_after = self.root.after(1000, self._poll_reminders)
         busy = (self._task is not None or self._listen is not None or self._approval is not None
                 or self._enrollment is not None)
         if not busy:  # si está ocupado, el aviso espera unos segundos
@@ -927,7 +928,6 @@ class DesktopWindow:
                 due = []
             if due:
                 self.announce(due)
-        self._reminders_after = self.root.after(1000, self._poll_reminders)
 
     def announce(self, reminders) -> None:
         from .reminders import announcement

@@ -142,9 +142,7 @@ class MemoryStore:
         return [self._reminder(row) for row in rows]
 
     def cancel_reminder(self, reminder_id: int) -> Reminder | None:
-        """Cancela un aviso pendiente; con 0 cancela el más próximo."""
-        pending = self.pending_reminders()
-        chosen = pending[:1] if reminder_id == 0 else [item for item in pending if item.id == reminder_id]
+        chosen = [item for item in self.pending_reminders() if item.id == reminder_id]
         if not chosen:
             return None
         with closing(self._connect()) as connection, connection:

@@ -441,9 +441,34 @@ class FollowUpTests(unittest.TestCase):
         window = self.make(["sí, por favor"], brain)
         window.command.set("estoy aburrido")
         window.submit()
-        self.wait_until(lambda: self.tools.open_url.called)
+        self.wait_until(lambda: self.tools.open_url.called and window._task is None)
         self.assertEqual(brain.decide.call_args_list[1].args[0], "sí, por favor")
         self.assertEqual(self.voice.listens, 1)
+
+    def test_due_reminder_is_spoken_and_shown_once_the_window_is_free(self):
+        from datetime import datetime, timedelta
+
+        from jarvis.memory import MemoryStore
+
+        store = MemoryStore(self.audit.path.parent / "m.sqlite3")
+        store.add_reminder("sacar la ropa", datetime.now() - timedelta(seconds=1), "recordatorio")
+        window = self.make([])
+        window.floating_orb = Mock()
+        self.voice.say = Mock()
+        with unittest.mock.patch("jarvis.desktop._reminder_chime") as chime:
+            window.enable_reminders(store)
+            window._listen = Mock()  # ocupado: el aviso espera
+            window._poll_reminders()
+            self.assertEqual(len(store.pending_reminders()), 1)
+            window._listen = None
+            window._poll_reminders()
+            self.wait_until(lambda: self.voice.say.called)
+        self.voice.say.assert_called_once_with("Señor, le recuerdo: sacar la ropa.")
+        self.assertIn("sacar la ropa", window.output.get("1.0", "end"))
+        window.floating_orb.show.assert_called()
+        chime.assert_called_once_with(False)
+        self.assertEqual(store.pending_reminders(), [])
+        window.floating_orb = None
 
     def test_silence_after_a_question_closes_the_microphone_quietly(self):
         from jarvis.brain import Decision

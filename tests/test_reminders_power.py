@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from jarvis.audit import Audit
 from jarvis.brain import TIME_WORDS
@@ -11,6 +11,7 @@ from jarvis.memory import MAX_PENDING_REMINDERS, MemoryStore
 from jarvis.reminders import ReminderClock, announcement, describe_duration
 from jarvis.tools import GpuReading, LocalTools, ProgramUsage, Reminder, RemindersFull, ToolId, normalize
 from jarvis.when import describe_due, parse_duration, parse_reminder
+from jarvis.windows import WindowsTools
 
 NOW = datetime(2026, 11, 22, 21, 30)  # domingo
 
@@ -55,13 +56,29 @@ class ParserTests(unittest.TestCase):
                 moment, what, kind = parse(text)
                 self.assertEqual((moment, what, kind), (due, task, "recordatorio"))
 
+    def test_tricky_hours(self):
+        morning = datetime(2026, 11, 25, 8, 0)
+        cases = {
+            "recuérdame a la una de la tarde almorzar": (datetime(2026, 11, 25, 13, 0), "almorzar"),
+            "recuérdame a las siete y veinte de la noche salir": (datetime(2026, 11, 25, 19, 20), "salir"),
+            "recuérdame esta noche a las 9 estudiar": (datetime(2026, 11, 25, 21, 0), "estudiar"),
+            "recuérdame a las 12 de la noche dormir": (datetime(2026, 11, 26, 0, 0), "dormir"),
+            "recuérdame a las 15:30 reunión": (datetime(2026, 11, 25, 15, 30), "reunion"),
+        }
+        for text, (due, task) in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(parse(text, morning)[:2], (due, task))
+
     def test_alarms(self):
         self.assertEqual(parse("pon una alarma a las 6:30 de la mañana"), (datetime(2026, 11, 23, 6, 30), "", "alarma"))
         self.assertEqual(parse("despiértame a las 6 y media"), (datetime(2026, 11, 23, 6, 30), "", "alarma"))
 
     def test_leaves_the_rest_to_the_ai(self):
         for text in ("recuérdame algo importante", "recuerda que me gusta el café", "pon el volumen al 35",
-                     "temporizador de cocina"):
+                     "temporizador de cocina", "recuérdame el 30 de noviembre a las 3 de la tarde entregar",
+                     "recuérdame en 3 días a las 5 llamar", "recuérdame todos los días a las 8 tomar agua",
+                     "recuérdame la próxima semana a las 9 ir al banco", "recuérdame el viernes 4 a las 2 el parcial",
+                     "recuérdame el 30 a las 3 entregar", "avísame a las 45"):
             with self.subTest(text=text):
                 self.assertIsNone(parse(text))
 
@@ -76,7 +93,8 @@ class ParserTests(unittest.TestCase):
 
     def test_the_brain_gets_the_time_for_reminders(self):
         self.assertTrue(TIME_WORDS.search("recuérdame el viernes"))
-        self.assertTrue(TIME_WORDS.search("pon una alarma"))
+        for text in ("pon una alarma", "en 3 horas", "en dos días", "recuérdame eso", "el 30 de noviembre"):
+            self.assertTrue(TIME_WORDS.search(text), text)
         self.assertFalse(TIME_WORDS.search("hola Jarvis"))
 
 
@@ -95,6 +113,13 @@ class RoutingTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(route(text), expected)
 
+    def test_ordinary_questions_go_to_the_ai(self):
+        for text in ("qué me comentaste de la memoria", "dime cómo se come la memoria caché el procesador",
+                     "qué es una gpu", "cuál gráfica me recomiendas comprar", "cuánto cuesta una gpu",
+                     "qué es una alarma", "apaga la alarma"):
+            with self.subTest(text=text):
+                self.assertIsNone(route(text)[0])
+
     def test_reminder_commands(self):
         tool, arguments = route("Jarvis, recuérdame mañana a las 7 que tengo examen de Cálculo")
         self.assertIs(tool, ToolId.ADD_REMINDER)
@@ -103,8 +128,9 @@ class RoutingTests(unittest.TestCase):
         self.assertRegex(arguments["due"], r"T07:00:00$")
         self.assertEqual(route("qué recordatorios tengo"), (ToolId.LIST_REMINDERS, {}))
         self.assertEqual(route("cuánto falta"), (ToolId.LIST_REMINDERS, {}))
-        self.assertEqual(route("cancela el temporizador"), (ToolId.CANCEL_REMINDER, {"reminder_id": 0}))
-        self.assertEqual(route("borra el recordatorio 3"), (ToolId.CANCEL_REMINDER, {"reminder_id": 3}))
+        self.assertEqual(route("cancela el temporizador"), (ToolId.CANCEL_REMINDER, {"reminder_id": 0, "kind": "temporizador"}))
+        self.assertEqual(route("cancela la alarma"), (ToolId.CANCEL_REMINDER, {"reminder_id": 0, "kind": "alarma"}))
+        self.assertEqual(route("borra el recordatorio 3"), (ToolId.CANCEL_REMINDER, {"reminder_id": 3, "kind": "aviso"}))
 
     def test_power_commands(self):
         cases = {
@@ -171,10 +197,13 @@ class ToolTests(unittest.TestCase):
         self.tools.list_reminders.return_value = [reminder]
         self.assertIn("4. Recordatorio «sacar la ropa», en 10 minutos", self.run_text("mis recordatorios").message)
         self.tools.cancel_reminder.return_value = reminder
-        self.assertIn("Cancelado: recordatorio «sacar la ropa»", self.run_text("cancela el recordatorio 4").message)
+        self.assertIn("Cancelado: Recordatorio «sacar la ropa»", self.run_text("cancela el recordatorio 4").message)
         self.tools.cancel_reminder.assert_called_with(4)
-        self.tools.cancel_reminder.return_value = None
-        self.assertEqual(self.run_text("cancela la alarma").code, 2)
+        self.tools.cancel_reminder.reset_mock()
+        self.assertEqual(self.run_text("cancela la alarma").message, "No tengo una alarma pendiente.")
+        self.tools.list_reminders.return_value = [reminder, Reminder(5, "", reminder.due, "recordatorio")]
+        self.assertIn("¿Qué número cancelo?", self.run_text("cancela el recordatorio").message)
+        self.tools.cancel_reminder.assert_not_called()
 
     def test_power_needs_approval_and_lock_does_not(self):
         refused = self.run_text("apaga el pc")
@@ -210,7 +239,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.next_due(), now - timedelta(seconds=1))
         self.assertEqual([item.text for item in self.store.take_due(now)], ["estudiar"])
         self.assertEqual(self.store.take_due(now), [])  # no avisa dos veces
-        self.assertEqual(self.store.cancel_reminder(0).id, soon)  # 0 = el más próximo
+        self.assertEqual(self.store.cancel_reminder(soon).id, soon)
         self.assertIsNone(self.store.cancel_reminder(soon))
         self.assertEqual([item.id for item in self.store.pending_reminders()], [later])
 
@@ -231,6 +260,33 @@ class StoreTests(unittest.TestCase):
         self.store.take_due.assert_not_called()
         self.assertEqual([item.text for item in clock.due(now + timedelta(minutes=1))], ["ropa"])
         self.assertEqual(clock.due(now + timedelta(minutes=2)), [])
+
+
+class PowerTests(unittest.TestCase):
+    """Nunca ejecuta shutdown.exe ni suspende: se sustituye la llamada."""
+
+    def setUp(self):
+        self.windows = WindowsTools()
+        self.windows._shutdown_exe = Mock(return_value=0)
+
+    def test_cancel_asks_windows_even_after_restarting_jarvis(self):
+        self.assertTrue(self.windows.cancel_power())
+        self.windows._shutdown_exe.assert_called_once_with("/a")
+        self.windows._shutdown_exe.return_value = 1116
+        self.assertFalse(self.windows.cancel_power())
+        self.windows._shutdown_exe.return_value = 5
+        with self.assertRaises(OSError):
+            self.windows.cancel_power()
+
+    def test_shutdown_and_sleep(self):
+        self.windows.power("shutdown")
+        self.assertEqual(self.windows._shutdown_exe.call_args.args[:3], ("/s", "/t", "60"))
+        self.windows._shutdown_exe.return_value = 1116
+        with patch("jarvis.windows._suspend") as suspend:
+            self.windows.power("sleep")
+            self.assertTrue(self.windows.cancel_power())
+            self.assertFalse(self.windows.cancel_power())
+            suspend.assert_not_called()
 
 
 class AnnouncementTests(unittest.TestCase):

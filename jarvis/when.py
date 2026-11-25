@@ -20,8 +20,9 @@ _DURATION = rf"(?:media hora|un cuarto de hora|(?:{_NUMBER}) (?:{_UNIT})(?: y me
 DURATION_EXPR = re.compile(rf"(?:{_DURATION})(?:,? y (?:{_DURATION}))*")
 RELATIVE = re.compile(rf"\b(?:en|dentro de) (?P<duration>{DURATION_EXPR.pattern})")
 CLOCK = re.compile(
-    r"\b(?:a las?|para las?) (?P<hour>\d{1,2}|" + "|".join(w for w in NUMBERS if NUMBERS[w] <= 12) + r")"
-    r"(?::(?P<minute>\d{2})| y (?P<fraction>media|cuarto)| menos cuarto(?P<minus>)| y (?P<minutes>\d{1,2}))?"
+    r"\b(?:a las?|para las?) (?P<hour>\d{1,2}|" + "|".join(w for w in NUMBERS if NUMBERS[w] <= 12) + r")\b"
+    r"(?::(?P<minute>\d{2})| y (?P<fraction>media|cuarto)| menos cuarto(?P<minus>)| y (?P<minutes>\d{1,2}|"
+    + "|".join(sorted((w for w in NUMBERS if 1 < NUMBERS[w] < 60), key=len, reverse=True)) + r")\b)?"
     r"(?: (?:de la |en la |por la )?(?P<period>manana|tarde|noche|madrugada)| (?P<ampm>am|pm|a ?m|p ?m))?"
 )
 NOON = re.compile(r"\b(?:al|a) (?P<word>mediodia|medianoche)\b")
@@ -32,6 +33,12 @@ TRIGGER = re.compile(
     r"programa (?:una alarma|un recordatorio))\b"
 )
 TIMER = re.compile(r"^(?:(?:pon|ponme|crea|programa|inicia|activa)(?: un| el)? )?temporizador(?: de| por| para)? (?P<rest>.+)$")
+# Fechas y repeticiones que este intérprete no sabe calcular: mejor la IA que una fecha equivocada.
+UNSUPPORTED = re.compile(
+    r"\b(?:enero|febrero|marzo|abril|mayo|junio|julio|agosto|sep?tiembre|octubre|noviembre|diciembre|"
+    r"proxim[oa]s?|que viene|siguiente|cada|todos los|todas las|diario|diariamente|dias|semanas?|mes|meses|"
+    r"fin de semana|el (?:dia )?\d{1,2}|(?:" + "|".join(WEEKDAYS) + r") \d{1,2})\b"
+)
 ALARM = re.compile(r"\balarma\b|^despiertame")
 
 
@@ -73,14 +80,16 @@ def _clock_time(match, day: datetime, explicit_day: bool, now: datetime, loose_p
     if match["minute"]:
         minute = int(match["minute"])
     elif match["minutes"]:
-        minute = int(match["minutes"])
+        minute = _number(match["minutes"])
     elif match["fraction"]:
         minute = 30 if match["fraction"] == "media" else 15
     elif match["minus"] is not None:
         hour, minute = hour - 1, 45
     period = match["period"] or loose_period
     ampm = (match["ampm"] or "").replace(" ", "")
-    if period in ("tarde", "noche") or ampm == "pm":
+    if period == "noche" and hour == 12:
+        day, hour = day + timedelta(days=1), 0  # «las 12 de la noche» es la medianoche que viene
+    elif period in ("tarde", "noche") or ampm == "pm":
         if hour < 12:
             hour += 12
     elif (period in ("manana", "madrugada") or ampm == "am") and hour == 12:
@@ -139,6 +148,8 @@ def parse_reminder(text: str, now: datetime | None = None):
     if not trigger:
         return None
     kind = "alarma" if ALARM.search(trigger.group(0)) else "recordatorio"
+    if UNSUPPORTED.search(text):
+        return None
     relative = RELATIVE.search(text)
     if relative:
         duration = parse_duration(relative["duration"])
@@ -154,7 +165,12 @@ def parse_reminder(text: str, now: datetime | None = None):
     day, explicit = _resolve_day(day_match, now)
     loose = PERIOD.search(rest) if clock and not clock["period"] else None
     if clock:
-        moment = _clock_time(clock, day, explicit, now, loose["period"] if loose else None)
+        if _number(clock["hour"]) > 23 or int(clock["minute"] or 0) > 59 or _number(clock["minutes"] or "0") > 59:
+            return None
+        period = loose["period"] if loose else None
+        if day_match and day_match["day"] in ("esta noche", "esta tarde"):
+            period = period or day_match["day"].split()[1]
+        moment = _clock_time(clock, day, explicit, now, period)
         removed = clock.group(0)
     elif noon:
         moment = day.replace(hour=12 if noon["word"] == "mediodia" else 0, minute=0, second=0, microsecond=0)

@@ -543,13 +543,21 @@ def _list_reminders(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
 
 
 def _cancel_reminder(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
-    reminder_id = cast(int, arguments["reminder_id"])
-    cancelled = tools.cancel_reminder(reminder_id)
+    reminder_id, kind = cast(int, arguments["reminder_id"]), cast(str, arguments["kind"])
+    matching = [item for item in tools.list_reminders()
+                if (kind == "aviso" or item.kind == kind) and reminder_id in (0, item.id)]
+    if not matching:
+        what = f"un aviso pendiente con el número {reminder_id}" if reminder_id else f"un {kind} pendiente"
+        if reminder_id == 0 and kind == "alarma":
+            what = "una alarma pendiente"
+        return ToolOutcome(2, "no_encontrada", f"No tengo {what}.")
+    if len(matching) > 1:  # nunca adivina cuál borrar
+        rows = [f"{item.id}. {describe_reminder(item)}." for item in matching]
+        return ToolOutcome(2, "ambigua", "\n".join(["Hay varios pendientes:", *rows, "¿Qué número cancelo?"]))
+    cancelled = tools.cancel_reminder(matching[0].id)
     if cancelled is None:
-        if reminder_id == 0:
-            return ToolOutcome(2, "no_encontrada", "No hay avisos pendientes que cancelar.")
-        return ToolOutcome(2, "no_encontrada", f"No tengo un aviso pendiente con el número {reminder_id}.")
-    return ToolOutcome(0, "completada", f"Cancelado: {describe_reminder(cancelled).lower()}.")
+        return ToolOutcome(2, "no_encontrada", "Ese aviso ya no está pendiente.")
+    return ToolOutcome(0, "completada", f"Cancelado: {describe_reminder(cancelled)}.")
 
 
 POWER_LABELS = {"shutdown": "Apagaré el equipo", "restart": "Reiniciaré el equipo",
@@ -765,7 +773,10 @@ TOOLS: Mapping[ToolId, ToolSpec] = MappingProxyType({
             permission=Permission.CANCEL_REMINDER,
             error_target="cancelar el aviso",
             handler=_cancel_reminder,
-            parameters=(ArgumentSpec("reminder_id", int, bounds=(0, 2**31 - 1)),),
+            parameters=(
+                ArgumentSpec("reminder_id", int, bounds=(0, 2**31 - 1)),
+                ArgumentSpec("kind", str, allowed_values=(*REMINDER_KINDS, "aviso")),
+            ),
             invalid_arguments="Indica el número del aviso. Ejemplo «cancela el recordatorio 2».",
         ),
         ToolSpec(

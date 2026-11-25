@@ -27,6 +27,7 @@ from .tools import (
 )
 
 CREATE_NO_WINDOW = 0x08000000
+ERROR_NO_SHUTDOWN_IN_PROGRESS = 1116
 
 TH32CS_SNAPPROCESS = 0x00000002
 ERROR_NO_MORE_FILES = 18
@@ -72,7 +73,6 @@ class WindowsTools:
         self._apps = app_catalog.AppCatalog()
         self._desktop: DesktopControl | None = None
         self._dismiss_requested = threading.Event()
-        self._pending_power: str | None = None  # "shutdown", "restart" o "sleep"
         self._sleep_timer: threading.Timer | None = None
 
         kernel = ct.WinDLL("kernel32.dll", use_last_error=True)
@@ -240,37 +240,35 @@ class WindowsTools:
 
     # --- energía ----------------------------------------------------------------------
 
-    def _shutdown_exe(self, *arguments: str) -> None:
+    def _shutdown_exe(self, *arguments: str) -> int:
         exe = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "shutdown.exe"
         completed = subprocess.run([str(exe), *arguments], capture_output=True, creationflags=CREATE_NO_WINDOW,
                                    timeout=10)
-        if completed.returncode != 0:
-            raise OSError(completed.returncode, "shutdown.exe rechazó la orden")
+        return completed.returncode
 
     def power(self, action: str) -> None:
         self.cancel_power()
         delay = POWER_DELAY_SECONDS[action]
         if action == "sleep":
-            timer = threading.Timer(delay, _suspend)
-            timer.daemon = True
-            timer.start()
-            self._sleep_timer = timer
-        else:
-            flag = "/s" if action == "shutdown" else "/r"
-            self._shutdown_exe(flag, "/t", str(delay), "/c", "JARVIS: orden del usuario.")
-        self._pending_power = action
+            self._sleep_timer = threading.Timer(delay, _suspend)
+            self._sleep_timer.daemon = True
+            self._sleep_timer.start()
+            return
+        code = self._shutdown_exe("/s" if action == "shutdown" else "/r", "/t", str(delay),
+                                  "/c", "JARVIS: orden del usuario.")
+        if code != 0:
+            raise OSError(code, "shutdown.exe rechazó la orden")
 
     def cancel_power(self) -> bool:
-        pending, self._pending_power = self._pending_power, None
-        if self._sleep_timer is not None:
-            self._sleep_timer.cancel()
-            self._sleep_timer = None
-        if pending in ("shutdown", "restart"):
-            try:
-                self._shutdown_exe("/a")
-            except (OSError, subprocess.SubprocessError):
-                return False
-        return pending is not None
+        """Se pregunta a Windows y no a JARVIS: así funciona aunque JARVIS se haya reiniciado."""
+        timer, self._sleep_timer = self._sleep_timer, None
+        sleeping = timer is not None and timer.is_alive()
+        if timer is not None:
+            timer.cancel()
+        code = self._shutdown_exe("/a")
+        if code not in (0, ERROR_NO_SHUTDOWN_IN_PROGRESS):
+            raise OSError(code, "shutdown.exe no pudo cancelar")
+        return sleeping or code == 0
 
     def lock(self) -> None:
         if not ct.WinDLL("user32.dll", use_last_error=True).LockWorkStation():

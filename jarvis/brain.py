@@ -29,8 +29,9 @@ NOTE_LIMIT = 300
 
 TIME_NOTE_SECONDS = 300
 TIME_WORDS = re.compile(
-    r"\b(?:hora|fecha|hoy|mañana|día|dia|minutos?|recuerd\w*|av[ií]s\w*|alarma|temporizador|despi[eé]rt\w*|semana|"
-    r"lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo)\b", re.IGNORECASE
+    r"\b(?:horas?|fechas?|hoy|mañana|tarde|noche|d[ií]as?|minutos?|recuerd\w*|recu[eé]rd\w*|av[ií]s\w*|alarmas?|"
+    r"temporizador\w*|despi[eé]rt\w*|semanas?|mes|meses|lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo|"
+    r"enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\b", re.IGNORECASE
 )
 WEEKDAYS = ("lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo")
 MONTHS = ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre",
@@ -66,9 +67,11 @@ TOOL_CATALOG = (
     ("system.gpu", "{}", "uso, VRAM y temperatura de la GPU NVIDIA"),
     ("reminders.add", '{"text": "qué recordar, o \\"\\" si no se dijo", "due": "AAAA-MM-DDTHH:MM:SS en hora local", '
                       '"kind": "recordatorio" | "alarma" | "temporizador"}',
-     "programa un aviso; calcula «due» sumando a la fecha y hora local actuales"),
+     "programa UN aviso único; calcula «due» a partir de la fecha y hora local actuales. No hay avisos "
+     "repetidos: si piden «todos los días» o «cada…», dilo en reply y no programes nada"),
     ("reminders.list", "{}", "lista los recordatorios, alarmas y temporizadores pendientes"),
-    ("reminders.cancel", '{"reminder_id": entero, 0 = el más próximo}', "cancela un aviso pendiente"),
+    ("reminders.cancel", '{"reminder_id": entero, 0 si no dijo número, "kind": "recordatorio" | "alarma" | '
+                         '"temporizador" | "aviso" (cualquiera)}', "cancela un aviso que aún no ha sonado"),
     ("system.power", '{"action": "shutdown" | "restart" | "sleep"}',
      "apaga, reinicia o suspende el equipo tras una cuenta atrás; JARVIS pedirá aprobación"),
     ("system.lock", "{}", "bloquea el equipo (pantalla de inicio de sesión)"),
