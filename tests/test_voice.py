@@ -99,6 +99,79 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(len(audio), 1600 * 7)
 
 
+    def test_reports_the_first_pause_and_when_speech_resumes(self):
+        events = []
+        audio = record_until_silence(
+            threading.Event(), blocks=self.blocks("---" + "#" * 5 + "-" * 6 + "#" * 4 + "-" * 30),
+            on_pause=lambda heard: events.append(("pausa", len(heard) // 1600)),
+            on_resume=lambda: events.append("sigue"),
+        )
+        self.assertEqual(events, [("pausa", 12), "sigue", ("pausa", 22)])
+        self.assertEqual(len(audio), 1600 * 28)
+
+
+class EarlyTranscriptionTests(unittest.TestCase):
+    def listen(self, script, transcribe):
+        recognizer = Mock(loaded=True)
+        recognizer.transcribe.side_effect = transcribe
+
+        def record(stop, *, on_level, on_pause, on_resume):
+            return script(on_pause, on_resume)
+
+        text = Voice(recognizer=recognizer, synthesizer=Mock(), record=record).listen(threading.Event())
+        return text, [call.args[0] for call in recognizer.transcribe.call_args_list]
+
+    def test_reuses_the_text_started_during_the_pause(self):
+        text, calls = self.listen(lambda pause, resume: pause("abre") or "abre y silencio", lambda audio: f"[{audio}]")
+        self.assertEqual((text, calls), ("[abre]", ["abre"]))  # una sola transcripción
+
+    def test_discards_it_if_the_user_keeps_talking(self):
+        def script(pause, resume):
+            pause("abre")
+            resume()
+            return "abre discord"
+
+        text, calls = self.listen(script, lambda audio: f"[{audio}]")
+        self.assertEqual(text, "[abre discord]")
+        self.assertEqual(calls[-1], "abre discord")
+
+    def test_discarded_pauses_do_not_pile_up(self):
+        release = threading.Event()
+
+        def transcribe(audio):
+            if audio == "uno":
+                release.wait(3)
+            return f"[{audio}]"
+
+        def script(pause, resume):
+            pause("uno")
+            sleep(0.1)  # «uno» ya está en marcha y no se puede interrumpir
+            for audio in ("dos", "tres"):
+                resume()
+                pause(audio)
+            release.set()
+            return "final"
+
+        text, calls = self.listen(script, transcribe)
+        self.assertEqual((text, calls), ("[tres]", ["uno", "tres"]))  # «dos» nunca empezó
+
+    def test_falls_back_when_the_early_attempt_fails(self):
+        attempts = []
+
+        def transcribe(audio):
+            attempts.append(audio)
+            if len(attempts) == 1:
+                raise RuntimeError("fallo")
+            return "bien"
+
+        self.assertEqual(self.listen(lambda pause, resume: pause("a") or "a", transcribe)[0], "bien")
+
+    def test_an_empty_result_is_silence(self):
+        text, calls = self.listen(lambda pause, resume: pause("ruido") or "ruido", lambda audio: "")
+        self.assertIsNone(text)
+        self.assertEqual(len(calls), 1)
+
+
 class RecognizerTests(unittest.TestCase):
     def fake_model(self, *texts):
         model = Mock()
@@ -207,11 +280,11 @@ class SynthesizerTests(unittest.TestCase):
 
     def test_listen_returns_none_without_speech_and_transcribes_otherwise(self):
         recognizer = Mock(transcribe=Mock(return_value="hola"))
-        voice = Voice(recognizer=recognizer, synthesizer=Mock(), record=lambda stop, on_level=None: None)
+        voice = Voice(recognizer=recognizer, synthesizer=Mock(), record=lambda stop, **options: None)
         self.assertIsNone(voice.listen(threading.Event()))
         recognizer.transcribe.assert_not_called()
         transcribing = Mock()
-        voice = Voice(recognizer=recognizer, synthesizer=Mock(), record=lambda stop, on_level=None: b"a")
+        voice = Voice(recognizer=recognizer, synthesizer=Mock(), record=lambda stop, **options: b"a")
         self.assertEqual(voice.listen(threading.Event(), on_transcribing=transcribing), "hola")
         transcribing.assert_called_once_with()
 

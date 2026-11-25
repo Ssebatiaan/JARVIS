@@ -16,7 +16,9 @@ from time import monotonic, sleep
 
 SAMPLE_RATE = 16_000
 BLOCK_SECONDS = 0.1
-WHISPER_MODEL = "base"
+# Con la voz del usuario: base falla el 16 % de las palabras y small el 4 % (1,3 s más, 225 MiB más).
+WHISPER_MODEL = "small"
+FALLBACK_MODEL = "base"
 # Órdenes habituales: Whisper reconoce mejor lo que aparece aquí (no cuesta RAM).
 VOCABULARY = (
     "Jarvis, abre SAVIO. ¿Puedes abrir Discord? Abre YouTube y reproduce una canción. Pausa la canción. "
@@ -44,6 +46,7 @@ VOICE_PITCH = "-6Hz"
 IDLE_UNLOAD_SECONDS = 300
 MAX_RECORD_SECONDS = 15.0
 SILENCE_TO_STOP = 1.0
+EARLY_SILENCE = 0.4  # pausa tras la que se empieza a transcribir por si la orden ya terminó
 NO_SPEECH_TIMEOUT = 6.0
 MIN_THRESHOLD = 0.005
 MAX_THRESHOLD = 0.03
@@ -131,12 +134,15 @@ def record_until_silence(
     noise: float | None = None,
     block_seconds: float = BLOCK_SECONDS,
     deaf_seconds: float = 0.0,
+    on_pause: Callable | None = None,
+    on_resume: Callable[[], None] | None = None,
 ):
     """Graba hasta una pausa tras hablar. Devuelve el audio o None si no se detectó voz.
 
     ``stop`` termina la grabación antes de tiempo (se conserva lo grabado). ``noise`` es el ruido de
     fondo medido antes de que el usuario hable; ``deaf_seconds``, el comienzo que se graba pero no
-    cuenta como voz porque puede contener el pitido de JARVIS.
+    cuenta como voz porque puede contener el pitido de JARVIS. ``on_pause`` recibe lo grabado tras una
+    pausa corta y ``on_resume`` avisa de que el usuario siguió hablando.
     """
     import numpy as np
 
@@ -146,6 +152,8 @@ def record_until_silence(
     no_speech_blocks = round(NO_SPEECH_TIMEOUT / block_seconds)
     max_blocks = round(MAX_RECORD_SECONDS / block_seconds)
     deaf_blocks = round(deaf_seconds / block_seconds)
+    early_blocks = round(EARLY_SILENCE / block_seconds)
+    paused_at = None  # último bloque con voz cuando se avisó de la pausa
     collected, levels = [], []
     speech = False
     for block in source:
@@ -160,6 +168,14 @@ def record_until_silence(
         threshold = speech_threshold(noise if noise is not None else min(levels))
         voiced = [index for index, value in enumerate(levels) if value > threshold and index >= deaf_blocks]
         speech = bool(voiced)
+        if paused_at is not None and voiced[-1] != paused_at:
+            paused_at = None
+            if on_resume is not None:
+                on_resume()
+        if speech and paused_at is None and len(levels) - 1 - voiced[-1] >= early_blocks:
+            paused_at = voiced[-1]
+            if on_pause is not None:
+                on_pause(np.concatenate(collected).astype(np.float32))
         if speech and len(levels) - 1 - voiced[-1] >= silence_blocks:
             break
         if not speech and len(collected) >= no_speech_blocks:
@@ -194,7 +210,12 @@ class SpeechRecognizer:
             else:
                 from faster_whisper import WhisperModel
 
-                self._model = WhisperModel(self._model_name, device="cpu", compute_type="int8")
+                try:
+                    self._model = WhisperModel(self._model_name, device="cpu", compute_type="int8")
+                except Exception:  # sin descargar y sin internet: mejor entender menos que nada
+                    if self._model_name == FALLBACK_MODEL:
+                        raise
+                    self._model = WhisperModel(FALLBACK_MODEL, device="cpu", compute_type="int8")
         return self._model
 
     def preload(self) -> None:
@@ -538,6 +559,46 @@ class SpeechSynthesizer:
             self._fallback(text, stop)
 
 
+class _EarlyTranscription:
+    """Transcribe en segundo plano desde la primera pausa; se descarta si el usuario sigue hablando.
+
+    Una transcripción en marcha no se puede interrumpir, pero las descartadas que aún esperan turno
+    no llegan a empezar, así que nunca se acumulan.
+    """
+
+    def __init__(self, transcribe: Callable[[object], str]):
+        self._transcribe = transcribe
+        self._turn = threading.Lock()
+        self._current: dict | None = None
+
+    def start(self, audio) -> None:
+        job = {"wanted": True, "text": None, "done": threading.Event()}
+        self._current = job
+        threading.Thread(target=self._run, args=(job, audio), name="jarvis-transcribe", daemon=True).start()
+
+    def _run(self, job: dict, audio) -> None:
+        try:
+            with self._turn:
+                if job["wanted"]:
+                    job["text"] = self._transcribe(audio)
+        except Exception:
+            pass  # result() devuelve None y se transcribe del modo normal
+        finally:
+            job["done"].set()
+
+    def discard(self) -> None:
+        if self._current is not None:
+            self._current["wanted"] = False
+            self._current = None
+
+    def result(self) -> str | None:
+        job = self._current
+        if job is None:
+            return None
+        job["done"].wait()
+        return job["text"]
+
+
 class Voice:
     """Fachada para la ventana: escuchar, transcribir y hablar sin bloquear la interfaz."""
 
@@ -586,19 +647,27 @@ class Voice:
         self.stop_speaking()
         if not getattr(self.recognizer, "loaded", True):
             self.preload()  # el modelo se carga mientras el usuario habla
+        early = _EarlyTranscription(self.recognizer.transcribe)
+        options = {"on_level": on_level, "on_pause": early.start, "on_resume": early.discard}
         if microphone is not None:
             from .wake import CHUNK
 
-            audio = self._record(stop, on_level=on_level, blocks=microphone.blocks(stop),
-                                 noise=microphone.noise, block_seconds=CHUNK / SAMPLE_RATE,
-                                 deaf_seconds=CHIME_SECONDS if chimed else 0.0)
-        else:
-            audio = self._record(stop, on_level=on_level)
+            options |= {"blocks": microphone.blocks(stop), "noise": microphone.noise,
+                        "block_seconds": CHUNK / SAMPLE_RATE, "deaf_seconds": CHIME_SECONDS if chimed else 0.0}
+        try:
+            audio = self._record(stop, **options)
+        except BaseException:
+            early.discard()
+            raise
         if audio is None:
+            early.discard()
             return None
         if on_transcribing is not None:
             on_transcribing()
-        return self.recognizer.transcribe(audio) or None
+        text = early.result()
+        if text is None:
+            text = self.recognizer.transcribe(audio)
+        return text or None
 
     def say(self, text: str) -> None:
         self.stop_speaking()
