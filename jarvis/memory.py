@@ -4,10 +4,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .tools import MAX_MEMORY_TEXT, MAX_REMINDER_TEXT, MemoryFull, MemoryItem, Reminder, RemindersFull
+from .tools import MAX_MEMORY_TEXT, MAX_REMINDER_TEXT, MemoryFull, MemoryItem, Reminder, RemindersFull, Task, TasksFull
 
 MAX_FACTS = 50
 MAX_PENDING_REMINDERS = 50
+MAX_OPEN_TASKS = 200
 HISTORY_LIMIT = 20
 
 
@@ -41,6 +42,11 @@ class MemoryStore:
         connection.execute(
             "CREATE TABLE IF NOT EXISTS reminders ("
             "id INTEGER PRIMARY KEY, text TEXT NOT NULL, due TEXT NOT NULL, kind TEXT NOT NULL, "
+            "created_at TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0)"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS tasks ("
+            "id INTEGER PRIMARY KEY, text TEXT NOT NULL, due TEXT, has_time INTEGER NOT NULL, kind TEXT NOT NULL, "
             "created_at TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0)"
         )
         return connection
@@ -164,3 +170,31 @@ class MemoryStore:
             ).fetchall()
             connection.executemany("UPDATE reminders SET done = 1 WHERE id = ?", [(row[0],) for row in rows])
         return [self._reminder(row) for row in rows]
+
+    # --- tareas y eventos anotados (done: 0 abierta, 1 hecha, 2 borrada) -------------------
+
+    def add_task(self, text: str, due: datetime | None, has_time: bool, kind: str) -> int:
+        text = " ".join(text.split())[:MAX_REMINDER_TEXT]
+        with closing(self._connect()) as connection, connection:
+            (count,) = connection.execute("SELECT COUNT(*) FROM tasks WHERE done = 0").fetchone()
+            if count >= MAX_OPEN_TASKS:
+                raise TasksFull()
+            cursor = connection.execute(
+                "INSERT INTO tasks (text, due, has_time, kind, created_at) VALUES (?, ?, ?, ?, ?)",
+                (text, due.replace(microsecond=0).isoformat() if due else None, int(has_time), kind, self._now()),
+            )
+            return cursor.lastrowid
+
+    def open_tasks(self) -> list[Task]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT id, text, due, has_time, kind FROM tasks WHERE done = 0 ORDER BY due IS NULL, due, id"
+            ).fetchall()
+        return [Task(row[0], row[1], datetime.fromisoformat(row[2]) if row[2] else None, bool(row[3]), row[4])
+                for row in rows]
+
+    def close_task(self, task_id: int, done: int) -> bool:
+        with closing(self._connect()) as connection, connection:
+            return connection.execute(
+                "UPDATE tasks SET done = ? WHERE id = ? AND done = 0", (done, task_id)
+            ).rowcount > 0

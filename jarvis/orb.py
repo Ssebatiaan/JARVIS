@@ -419,6 +419,8 @@ class OrbWindow:
         return [
             ("Abrir chat", ICON_CHAT, self.toggle_chat),
             ("Comandos rápidos", ICON_QUICK, [
+                ("Agenda de la semana", "", lambda: run("¿Qué pendientes tengo esta semana?")),
+                ("Resumen del día", "", lambda: run("resumen del día")),
                 ("Estado del sistema", "", lambda: run("consulta CPU y RAM")),
                 ("Volumen", "", lambda: run("consulta el volumen")),
                 ("Qué recuerdas", "", lambda: run("qué recuerdas")),
@@ -426,6 +428,7 @@ class OrbWindow:
                 ("Escuchar", "", self.window.start_listening),
             ]),
             ("Configuración", ICON_SETTINGS, [
+                ("Conectar calendario", "", lambda: run("conecta un calendario")),
                 ("Tamaño", "", [(name.capitalize(), "", lambda n=name: self.set_size(n),
                                        check(name, self.size_name)) for name in SIZES]),
                 ("Tema", "", [(name.capitalize(), "", lambda n=name: self.set_theme(n),

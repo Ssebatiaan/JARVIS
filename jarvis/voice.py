@@ -23,7 +23,7 @@ FALLBACK_MODEL = "base"
 VOCABULARY = (
     "Jarvis, abre SAVIO. ¿Puedes abrir Discord? Abre YouTube y reproduce una canción. Pausa la canción. "
     "Minimiza todas las ventanas. Cambia a Opera GX. Cierra Spotify. Recuérdame mañana. Pon un temporizador. "
-    "Consulta la CPU, la RAM y la GPU. Sube o baja el volumen. Qué recuerdas, olvida. Eso es todo."
+    "¿Tengo algún pendiente esta semana? Anota una tarea. Consulta la CPU, la RAM y la GPU. Sube o baja el volumen. Qué recuerdas, olvida. Eso es todo."
 )
 VOICE = "es-MX-JorgeNeural"
 # Velocidad de la voz (el usuario la encontraba muy pausada a -6 %). Se cambia con la voz.
@@ -71,7 +71,7 @@ def missing_packages() -> list[str]:
 
 def speakable(text: str) -> str:
     """Adapta una respuesta para leerla en voz alta, sin tablas ni símbolos."""
-    text = text.strip()
+    text = text.split("\nDetalle:\n")[0].strip()  # el detalle largo solo se muestra
     if not text:
         return ""
     lines = [line for line in text.splitlines() if line.strip()]

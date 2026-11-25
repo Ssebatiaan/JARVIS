@@ -9,6 +9,8 @@ from uuid import uuid4
 
 from .audit import Audit
 from .brain import BrainUnavailable, Decision
+from .agenda import question as agenda_question
+from .calc import spoken_expression
 from .web import site_key
 from .when import parse_reminder
 from . import persona as jarvis_persona
@@ -114,6 +116,36 @@ REMINDER_CANCEL_PATTERN = re.compile(
     r"(?P<kind>recordatorio|alarma|temporizador|aviso)(?: (?:numero |n\.?o )?(?P<id>\d{1,9}))?$"
     r"|^(?:deten|para|apaga)(?: el| mi)? (?P<timer>temporizador)$"
 )
+SUMMARY_COMMANDS = {"resumen del dia", "dame el resumen del dia", "dame un resumen del dia", "mi resumen del dia",
+                    "dame mi resumen", "ponme al dia", "que hay para hoy", "como va mi dia", "como pinta el dia"}
+TASK_ADD_PATTERN = re.compile(
+    r"^(?:anota|anotame|apunta|apuntame|agrega|anade)(?: (?:la|una) tarea(?: de)?:?| a mis tareas| que (?:tengo que|debo))? "
+    r"(?P<text>.+)$"
+)
+# Con fechas, reuniones o listas decide la IA, que sí sabe calcularlas.
+TASK_NEEDS_AI = re.compile(
+    r"\b(?:hoy|manana|noche|tarde|semana|mes|dias?|lunes|martes|miercoles|jueves|viernes|sabado|domingo|enero|febrero|"
+    r"marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre|a las?|\d{1,2}|reunion|cita|evento|"
+    r"calendario|recordatorio|alarma|cancion|playlist|carrito|para el)\b"
+)
+TASK_DONE_PATTERN = re.compile(
+    r"^(?:marca|pon)(?: como)? (?:hecha|terminada|completada|lista) (?:la )?tarea (?P<a>.+)$"
+    r"|^(?:marca|pon) la tarea (?P<b>.+?) como (?:hecha|terminada|completada|lista)$"
+    r"|^(?:ya )?termine la tarea (?P<c>.+)$"
+)
+TASK_REMOVE_PATTERN = re.compile(r"^(?:borra|elimina|quita) la tarea (?P<task>.+)$")
+CALENDAR_CONNECT = re.compile(
+    r"^(?:conecta|conectar|vincula|agrega|anade)(?: (?:el|un|mi))? calendario(?: (?:de|a))?(?: \w+)?$"
+)
+CALENDAR_LIST = {"que calendarios tengo", "mis calendarios", "calendarios conectados", "que calendarios hay",
+                 "que calendarios tengo conectados"}
+CALENDAR_REMOVE = re.compile(r"^(?:desconecta|quita|borra|elimina) (?:el )?calendario(?: de)? (?P<name>.+)$")
+WEATHER_PATTERN = re.compile(
+    r"^(?:(?:dime|cual es|como esta|como va a estar|como estara) )?(?:que )?(?:el )?(?:clima|tiempo hace|temperatura hace)"
+    r"(?: (?:hace|hay|tenemos|va a hacer|hara))?(?: (?P<day>hoy|manana|ahora))?(?: (?:en|de) (?P<city>[a-z][a-z .]{1,40}?))?"
+    r"(?: (?P<day2>hoy|manana|ahora))?$|^va a llover(?: (?P<day3>hoy|manana))?$"
+)
+CITY_COMMAND = re.compile(r"^(?:mi ciudad es|usa la ciudad(?: de)?) (?P<city>[a-z][a-z .]{1,40})$")
 _PC = r"(?: (?:el|la|mi))? (?:pc|computador|computadora|equipo|ordenador|portatil|laptop|maquina)"
 POWER_PATTERNS = (
     (re.compile(rf"^(?:apaga|apagar|apagame){_PC}$"), ToolId.POWER, "shutdown"),
@@ -138,7 +170,9 @@ HELP = (
     "«minimiza todo»), consultar CPU, RAM y volumen, ajustar el volumen, listar procesos y "
     "recordar cosas («recuerda que…», «qué recuerdas», «olvida el recuerdo N»), programar avisos "
     "(«recuérdame en 20 minutos…», «pon un temporizador de 10 minutos»), revisar la GPU y lo que más "
-    "consume, y apagar, reiniciar, suspender o bloquear el equipo. "
+    "consume, y apagar, reiniciar, suspender o bloquear el equipo. También llevo su agenda («¿tengo algún "
+    "pendiente esta semana?», «anota la tarea…», «resumen del día», «conecta un calendario»), el clima "
+    "(«qué clima hace») y cálculos («cuánto es 15 por 8»). "
     "Encadena hasta cinco órdenes con «y luego»."
 )
 
@@ -236,6 +270,38 @@ def _route(command: str, original: str | None = None) -> RoutedCommand:
         kind = cancel["kind"] or cancel["timer"]
         return ToolId.CANCEL_REMINDER, {"reminder_id": int(cancel["id"] or 0),
                                         "kind": "aviso" if cancel["id"] else kind}
+    if command in SUMMARY_COMMANDS:
+        return ToolId.DAY_SUMMARY, {}
+    if command in CALENDAR_LIST:
+        return ToolId.LIST_CALENDARS, {}
+    if CALENDAR_CONNECT.match(command):
+        return ToolId.CONNECT_CALENDAR, {}
+    match = CALENDAR_REMOVE.match(command)
+    if match:
+        return ToolId.REMOVE_CALENDAR, {"name": _restore(original, match["name"])}
+    asked = agenda_question(command, "?" in (original or ""))
+    if asked is not None:
+        return ToolId.AGENDA, dict(asked)
+    match = TASK_DONE_PATTERN.match(command)
+    if match:
+        return ToolId.FINISH_TASK, {"task": _restore(original, match["a"] or match["b"] or match["c"])}
+    match = TASK_REMOVE_PATTERN.match(command)
+    if match:
+        return ToolId.REMOVE_TASK, {"task": _restore(original, match["task"])}
+    match = TASK_ADD_PATTERN.match(command)
+    if match and not TASK_NEEDS_AI.search(match["text"]):
+        return ToolId.ADD_TASK, {"text": _restore(original, match["text"]), "due": "", "kind": "tarea"}
+    match = WEATHER_PATTERN.match(command)
+    if match:
+        day = match["day"] or match["day2"] or match["day3"]
+        return ToolId.WEATHER, {"city": _restore(original, match["city"]) if match["city"] else "",
+                                "day": "manana" if day == "manana" else "hoy"}
+    match = CITY_COMMAND.match(command)
+    if match:
+        return ToolId.SET_CITY, {"city": _restore(original, match["city"])}
+    expression = spoken_expression(command)
+    if expression is not None:
+        return ToolId.CALCULATE, {"expression": expression}
     for pattern, tool_id, action in POWER_PATTERNS:
         if pattern.match(command):
             return tool_id, ({"action": action} if action else {})

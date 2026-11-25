@@ -7,3 +7,6 @@ sounddevice==0.5.6
 edge-tts==7.3.1
 # Orbe flotante con transparencia real (sin Pillow JARVIS usa solo la barra).
 pillow==13.0.0
+# Agenda: calendarios por enlace iCal (SAVIO, Outlook, Google).
+icalendar==7.3.2
+recurring-ical-events==3.8.2

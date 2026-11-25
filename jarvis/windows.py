@@ -15,6 +15,8 @@ from .memory import MemoryStore
 from .web import find_youtube_video
 from .tools import (
     POWER_DELAY_SECONDS,
+    AgendaData,
+    AgendaItem,
     FolderRedirected,
     GpuReading,
     LocalFolder,
@@ -23,11 +25,14 @@ from .tools import (
     ProgramUsage,
     Reminder,
     SystemUsage,
+    Task,
     VolumeStatus,
 )
 
 CREATE_NO_WINDOW = 0x08000000
 ERROR_NO_SHUTDOWN_IN_PROGRESS = 1116
+CITY_SETTING = "clima.ciudad"
+CALENDAR_VAULT = "JARVIS/calendario/"
 
 TH32CS_SNAPPROCESS = 0x00000002
 ERROR_NO_MORE_FILES = 18
@@ -73,6 +78,9 @@ class WindowsTools:
         self._apps = app_catalog.AppCatalog()
         self._desktop: DesktopControl | None = None
         self._dismiss_requested = threading.Event()
+        self._calendar_requested = threading.Event()
+        self.can_show_calendar_dialog = False  # lo activa la ventana
+        self._calendars = None
         self._sleep_timer: threading.Timer | None = None
 
         kernel = ct.WinDLL("kernel32.dll", use_last_error=True)
@@ -237,6 +245,77 @@ class WindowsTools:
 
     def cancel_reminder(self, reminder_id: int) -> Reminder | None:
         return self._memory_store().cancel_reminder(reminder_id)
+
+    # --- agenda -----------------------------------------------------------------------
+
+    def calendars(self):
+        if self._calendars is None:
+            from .calendars import Calendars
+            from .vault import CredentialVault
+
+            self._calendars = Calendars(CredentialVault(CALENDAR_VAULT))
+        return self._calendars
+
+    def agenda(self, start, end, now) -> AgendaData:
+        current = start <= now  # hoy, esta semana o este mes: también lo atrasado y lo que no tiene fecha
+        items = []
+        for task in self._memory_store().open_tasks():
+            if task.due is None:
+                included = current
+            else:
+                past = task.due < now if task.has_time else task.due.date() < now.date()
+                if past:
+                    included = current and task.kind == "tarea"
+                else:
+                    included = start.date() <= task.due.date() and task.due < end
+            if included:
+                items.append(AgendaItem(task.due, not task.has_time, task.text, task.kind))
+        for reminder in self._memory_store().pending_reminders():
+            if reminder.kind != "temporizador" and start <= reminder.due < end:
+                items.append(AgendaItem(reminder.due, False, reminder.text or reminder.kind.capitalize(), "aviso"))
+        calendars = self.calendars()
+        events, warnings = calendars.events(start, end)
+        return AgendaData(items + events, warnings, len(calendars.names()))
+
+    def add_task(self, text: str, due, has_time: bool, kind: str) -> int:
+        return self._memory_store().add_task(text, due, has_time, kind)
+
+    def open_tasks(self) -> list[Task]:
+        return self._memory_store().open_tasks()
+
+    def finish_task(self, task_id: int) -> bool:
+        return self._memory_store().close_task(task_id, 1)
+
+    def remove_task(self, task_id: int) -> bool:
+        return self._memory_store().close_task(task_id, 2)
+
+    def calendar_names(self) -> list[str]:
+        return self.calendars().names()
+
+    def remove_calendar(self, name: str) -> bool:
+        return self.calendars().remove(name)
+
+    def request_calendar(self) -> bool:
+        """Pide a la ventana que muestre el diálogo: el enlace nunca pasa por una orden."""
+        if self.can_show_calendar_dialog:
+            self._calendar_requested.set()
+        return self.can_show_calendar_dialog
+
+    def take_calendar_request(self) -> bool:
+        requested = self._calendar_requested.is_set()
+        self._calendar_requested.clear()
+        return requested
+
+    def weather(self, city: str, day: str) -> str:
+        from .weather import report
+
+        return report(city, day)
+
+    def get_city(self) -> str | None:
+        return self._memory_store().get_setting(CITY_SETTING)
+
+    def set_city(self, city: str) -> None:
+        self._memory_store().set_setting(CITY_SETTING, city)
 
     # --- energía ----------------------------------------------------------------------
 

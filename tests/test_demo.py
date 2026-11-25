@@ -175,7 +175,9 @@ class DemoTests(unittest.TestCase):
             "busca gatos en Google", "reproduce lofi en YouTube", "qué hora es", "eso sería todo, Jarvis",
             "cuánto usa la GPU", "qué está consumiendo más RAM", "recuérdame en 5 minutos beber agua",
             "qué recordatorios tengo", "cancela el temporizador", "apaga el pc", "bloquea el pc",
-            "cancela el apagado",
+            "cancela el apagado", "¿qué pendientes tengo esta semana?", "resumen del día", "anota comprar pan",
+            "marca como hecha la tarea 1", "borra la tarea 1", "conecta un calendario", "qué calendarios tengo",
+            "desconecta el calendario SAVIO", "qué clima hace", "mi ciudad es Medellín", "cuánto es 15 por 8",
         )
         for command in commands:
             with self.subTest(command=command):

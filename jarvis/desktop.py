@@ -292,6 +292,9 @@ class DesktopWindow:
         self._wake_heard = Event()
         self._clap_heard = Event()
         self._wake_after: str | None = None
+        self._calendar_dialog = None
+        if hasattr(tools, "can_show_calendar_dialog"):
+            tools.can_show_calendar_dialog = True
         self._reminders = None  # ReminderClock (jarvis/reminders.py)
         self._reminders_after: str | None = None
         stored = preferences.get_setting(SPEECH_SETTING, "1") if preferences is not None else "1"
@@ -912,6 +915,14 @@ class DesktopWindow:
             self.hint.configure(text=f"«Hey Jarvis» no disponible: {self._wake.error}")
         self._wake_after = self.root.after(100, self._poll_wake)
 
+    def open_calendar_dialog(self) -> None:
+        from .calendar_dialog import CalendarDialog
+
+        if self._calendar_dialog is not None and self._calendar_dialog.alive:
+            self._calendar_dialog.show()
+            return
+        self._calendar_dialog = CalendarDialog(self.root, self.tools.calendars())
+
     # --- recordatorios, alarmas y temporizadores ------------------------------------
 
     def enable_reminders(self, store) -> None:
@@ -1211,6 +1222,9 @@ class DesktopWindow:
         self.entry.focus_set()
         if self.speak_enabled and self.voice is not None and result.message:
             self.voice.say(result.message)
+        take_calendar = getattr(self.tools, "take_calendar_request", None)
+        if callable(take_calendar) and take_calendar() is True:
+            self.open_calendar_dialog()
         take_dismiss = getattr(self.tools, "take_dismiss", None)
         if callable(take_dismiss) and take_dismiss() is True:
             self._dismiss_deadline = monotonic() + DISMISS_MAX_WAIT
@@ -1261,6 +1275,8 @@ class DesktopWindow:
                 except tk.TclError:
                     pass
         self._animation_after = self._blur_after = self._reminders_after = None
+        if self._calendar_dialog is not None:
+            self._calendar_dialog.close()
         self.release_tray()
         self.root.destroy()
 

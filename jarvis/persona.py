@@ -11,7 +11,8 @@ from datetime import datetime
 from .tools import ToolId
 
 REPORTS = {ToolId.SYSTEM_METRICS, ToolId.READ_VOLUME, ToolId.LIST_PROCESSES, ToolId.LIST_MEMORIES,
-           ToolId.TIME, ToolId.GPU, ToolId.TOP_PROGRAMS, ToolId.LIST_REMINDERS}
+           ToolId.TIME, ToolId.GPU, ToolId.TOP_PROGRAMS, ToolId.LIST_REMINDERS, ToolId.AGENDA,
+           ToolId.DAY_SUMMARY, ToolId.LIST_CALENDARS, ToolId.WEATHER, ToolId.CALCULATE}
 REPORT_OPENERS = ("Aquí tiene, señor.", "Con mucho gusto, señor.", "Enseguida, señor.")
 ACTION_OPENERS = ("Enseguida, señor.", "Por supuesto, señor.", "Ahora mismo, señor.", "Como desee, señor.")
 DENIED = "Me temo que no ha sido posible, señor."
@@ -43,6 +44,8 @@ def dress(tool_id: ToolId | None, code: int, message: str, *, rng: random.Random
     if code == 0:
         opener = choose(REPORT_OPENERS if tool_id in REPORTS else ACTION_OPENERS)
         return f"{opener} {message}"
+    if message.startswith("¿"):  # falta un dato: se pregunta sin más
+        return message
     if message.startswith("Acción rechazada"):
         return REJECTED
     if code == 2:

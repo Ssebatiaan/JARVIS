@@ -21,6 +21,12 @@ POWER_ACTIONS = ("shutdown", "restart", "sleep")
 POWER_DELAY_SECONDS = {"shutdown": 60, "restart": 60, "sleep": 15}
 DUE_PATTERN = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?"
 MAX_REMINDER_TEXT = 200
+TASK_DUE_PATTERN = r"(?:\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2})?)?)?"
+TASK_KINDS = ("tarea", "evento")
+AGENDA_PERIODS = ("hoy", "manana", "semana", "proxima_semana", "mes", "lunes", "martes", "miercoles", "jueves",
+                  "viernes", "sabado", "domingo")
+AGENDA_KINDS = ("todo", "tareas", "eventos")
+CITY_PATTERN = r"[^\W\d_][\w .,'-]{0,59}"
 # Un nombre de aplicación o ventana, nunca una ruta ni una orden.
 NAME_PATTERN = r"[^\\/:*?\"<>|;&]{1,80}"
 
@@ -62,6 +68,39 @@ class Reminder:
     due: datetime  # hora local
     kind: str
     created: datetime | None = None
+
+
+@dataclass(frozen=True)
+class AgendaItem:
+    when: datetime | None  # hora local; None si no tiene fecha
+    all_day: bool
+    title: str
+    kind: str  # "tarea", "evento" o "aviso"
+    source: str = ""  # nombre del calendario; vacío si se anotó en JARVIS
+
+
+@dataclass(frozen=True)
+class Task:
+    id: int
+    text: str
+    due: datetime | None
+    has_time: bool
+    kind: str
+
+
+@dataclass(frozen=True)
+class AgendaData:
+    items: list[AgendaItem]
+    warnings: list[str]
+    calendars: int
+
+
+class CalendarError(Exception):
+    """No se pudo conectar o leer un calendario. El mensaje nunca incluye el enlace."""
+
+
+class TasksFull(Exception):
+    """Demasiadas tareas abiertas."""
 
 
 @dataclass(frozen=True)
@@ -141,6 +180,17 @@ class LocalTools(Protocol):
     def power(self, action: str) -> None: ...
     def lock(self) -> None: ...
     def cancel_power(self) -> bool: ...
+    def agenda(self, start: datetime, end: datetime, now: datetime) -> AgendaData: ...
+    def add_task(self, text: str, due: datetime | None, has_time: bool, kind: str) -> int: ...
+    def open_tasks(self) -> list[Task]: ...
+    def finish_task(self, task_id: int) -> bool: ...
+    def remove_task(self, task_id: int) -> bool: ...
+    def calendar_names(self) -> list[str]: ...
+    def remove_calendar(self, name: str) -> bool: ...
+    def request_calendar(self) -> bool: ...
+    def weather(self, city: str, day: str) -> str: ...
+    def get_city(self) -> str | None: ...
+    def set_city(self, city: str) -> None: ...
 
 
 class ToolId(StrEnum):
@@ -171,6 +221,17 @@ class ToolId(StrEnum):
     POWER = "system.power"
     LOCK = "system.lock"
     CANCEL_POWER = "system.power_cancel"
+    AGENDA = "agenda.list"
+    ADD_TASK = "tasks.add"
+    FINISH_TASK = "tasks.done"
+    REMOVE_TASK = "tasks.remove"
+    DAY_SUMMARY = "summary.day"
+    CONNECT_CALENDAR = "calendars.connect"
+    LIST_CALENDARS = "calendars.list"
+    REMOVE_CALENDAR = "calendars.remove"
+    WEATHER = "weather.read"
+    SET_CITY = "weather.city"
+    CALCULATE = "math.calc"
 
 
 class Permission(Enum):
@@ -201,6 +262,17 @@ class Permission(Enum):
     POWER = "system.power"
     LOCK = "system.lock"
     CANCEL_POWER = "system.power.cancel"
+    READ_AGENDA = "agenda.read"
+    ADD_TASK = "tasks.write"
+    FINISH_TASK = "tasks.done"
+    REMOVE_TASK = "tasks.remove"
+    DAY_SUMMARY = "summary.read"
+    CONNECT_CALENDAR = "calendars.connect"
+    READ_CALENDARS = "calendars.read"
+    REMOVE_CALENDAR = "calendars.remove"
+    READ_WEATHER = "weather.read"
+    SET_CITY = "weather.city"
+    CALCULATE = "math.calc"
 
 
 DEFAULT_PERMISSIONS = frozenset({
@@ -231,6 +303,17 @@ DEFAULT_PERMISSIONS = frozenset({
     Permission.POWER,
     Permission.LOCK,
     Permission.CANCEL_POWER,
+    Permission.READ_AGENDA,
+    Permission.ADD_TASK,
+    Permission.FINISH_TASK,
+    Permission.REMOVE_TASK,
+    Permission.DAY_SUMMARY,
+    Permission.CONNECT_CALENDAR,
+    Permission.READ_CALENDARS,
+    Permission.REMOVE_CALENDAR,
+    Permission.READ_WEATHER,
+    Permission.SET_CITY,
+    Permission.CALCULATE,
 })
 
 MAX_MEMORY_TEXT = 300
@@ -586,6 +669,135 @@ def _cancel_power(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
     return ToolOutcome(2, "no_encontrada", "No había ningún apagado, reinicio ni suspensión pendiente.")
 
 
+def _agenda_text(tools: LocalTools, period: str, kind: str) -> str:
+    from .agenda import describe, period_range
+
+    now = datetime.now()
+    start, end, label = period_range(period, now)
+    data = tools.agenda(start, end, now)
+    return describe(data.items, label, kind, now, warnings=data.warnings, calendars=data.calendars)
+
+
+def _agenda(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
+    return ToolOutcome(0, "completada", _agenda_text(
+        tools, cast(str, arguments["period"]), cast(str, arguments["kind"])))
+
+
+def _day_summary(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
+    parts = [describe_time(datetime.now())]
+    city = tools.get_city()
+    if city:
+        try:
+            parts.append(tools.weather(city, "hoy"))
+        except (OSError, LookupError):
+            parts.append("No pude consultar el clima.")
+    parts.append(_agenda_text(tools, "hoy", "todo"))
+    return ToolOutcome(0, "completada", " ".join(parts))
+
+
+def _add_task(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
+    from .agenda import describe_when
+
+    raw = cast(str, arguments["due"]).strip()
+    now = datetime.now()
+    due, has_time = None, "T" in raw
+    if raw:
+        try:
+            due = datetime.fromisoformat(raw)
+        except ValueError:
+            return ToolOutcome(2, "denegada", "No entendí la fecha.")
+        if due.date() < now.date() or (has_time and due <= now):
+            return ToolOutcome(2, "denegada", "Esa fecha ya pasó. Indíqueme una futura.")
+    text = " ".join(cast(str, arguments["text"]).split())
+    kind = cast(str, arguments["kind"])
+    if kind == "evento" and due is None:
+        return ToolOutcome(2, "falta_dato", f"¿Para qué día anoto «{text}», señor?")
+    try:
+        task_id = tools.add_task(text, due, has_time, kind)
+    except TasksFull:
+        return ToolOutcome(2, "denegada", "Tiene demasiadas tareas abiertas. Termine o borre alguna primero.")
+    when = f", {describe_when(due, not has_time, now)}" if due else ", sin fecha"
+    return ToolOutcome(0, "completada", f"Anotado ({kind} {task_id}): «{text}»{when}.")
+
+
+def _pick_task(tools: LocalTools, wanted: str, *, fuzzy: bool = True) -> "Task | ToolOutcome":
+    from .agenda import describe_task, find_tasks
+
+    found = find_tasks(tools.open_tasks(), wanted, fuzzy=fuzzy)
+    if not found:
+        return ToolOutcome(2, "no_encontrada", f"No encontré «{wanted.strip()}» entre lo que anotó aquí. "
+                           "Lo que viene de un calendario no se puede cambiar desde JARVIS.")
+    if len(found) > 1:
+        now = datetime.now()
+        rows = [f"{task.id}. {describe_task(task, now)}." for task in found[:5]]
+        return ToolOutcome(2, "ambigua", "\n".join(["Hay varias parecidas:", *rows, "¿Qué número?"]))
+    return found[0]
+
+
+def _finish_task(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
+    task = _pick_task(tools, cast(str, arguments["task"]))
+    if isinstance(task, ToolOutcome):
+        return task
+    if not tools.finish_task(task.id):
+        return ToolOutcome(2, "no_encontrada", "Esa tarea ya no está abierta.")
+    return ToolOutcome(0, "completada", f"Marcada como hecha: «{task.text}».")
+
+
+def _remove_task(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
+    task = _pick_task(tools, cast(str, arguments["task"]), fuzzy=False)
+    if isinstance(task, ToolOutcome):
+        return task
+    if not tools.remove_task(task.id):
+        return ToolOutcome(2, "no_encontrada", "Esa tarea ya no está abierta.")
+    return ToolOutcome(0, "completada", f"Borrada: «{task.text}».")
+
+
+def _connect_calendar(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
+    if not tools.request_calendar():
+        return ToolOutcome(2, "no_disponible", "Abra la ventana de JARVIS para conectar un calendario.")
+    return ToolOutcome(0, "solicitada", "Le abro la ventana para conectar el calendario. Pegue ahí el enlace; es privado.")
+
+
+def _list_calendars(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
+    names = tools.calendar_names()
+    if not names:
+        return ToolOutcome(0, "completada", "No hay calendarios conectados. Diga «conecta un calendario».")
+    return ToolOutcome(0, "completada", f"Calendarios conectados: {', '.join(names)}.")
+
+
+def _remove_calendar(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
+    wanted = normalize(cast(str, arguments["name"]))
+    name = next((item for item in tools.calendar_names() if normalize(item) == wanted), None)
+    if name is None or not tools.remove_calendar(name):
+        return ToolOutcome(2, "no_encontrada", f"No hay un calendario llamado «{arguments['name']}».")
+    return ToolOutcome(0, "completada", f"Desconecté {name} y borré su enlace.")
+
+
+def _weather(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
+    city = cast(str, arguments["city"]).strip() or tools.get_city()
+    if not city:
+        return ToolOutcome(2, "falta_dato", "¿De qué ciudad, señor? Si dice «mi ciudad es…», la recordaré.")
+    try:
+        return ToolOutcome(0, "completada", tools.weather(city, cast(str, arguments["day"])))
+    except LookupError:
+        return ToolOutcome(2, "no_encontrada", f"No encontré la ciudad «{city}».")
+
+
+def _set_city(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
+    city = " ".join(cast(str, arguments["city"]).split())
+    tools.set_city(city)
+    return ToolOutcome(0, "completada", f"Usaré {city} para el clima.")
+
+
+def _calculate(tools: LocalTools, arguments: ToolArguments) -> ToolOutcome:
+    from .calc import CalcError, calculate
+
+    try:
+        return ToolOutcome(0, "completada", f"El resultado es {calculate(cast(str, arguments['expression']))}.")
+    except CalcError as error:
+        return ToolOutcome(2, "denegada", str(error))
+
+
 TOOLS: Mapping[ToolId, ToolSpec] = MappingProxyType({
     tool.id: tool for tool in (
         ToolSpec(
@@ -802,6 +1014,99 @@ TOOLS: Mapping[ToolId, ToolSpec] = MappingProxyType({
             permission=Permission.CANCEL_POWER,
             error_target="cancelar el apagado",
             handler=_cancel_power,
+        ),
+        ToolSpec(
+            id=ToolId.AGENDA,
+            permission=Permission.READ_AGENDA,
+            error_target="consultar la agenda",
+            handler=_agenda,
+            parameters=(
+                ArgumentSpec("period", str, allowed_values=AGENDA_PERIODS),
+                ArgumentSpec("kind", str, allowed_values=AGENDA_KINDS),
+            ),
+            invalid_arguments="Indica un periodo: hoy, mañana, un día de la semana, esta semana, la próxima o este mes.",
+        ),
+        ToolSpec(
+            id=ToolId.DAY_SUMMARY,
+            permission=Permission.DAY_SUMMARY,
+            error_target="preparar el resumen del día",
+            handler=_day_summary,
+        ),
+        ToolSpec(
+            id=ToolId.ADD_TASK,
+            permission=Permission.ADD_TASK,
+            error_target="anotar la tarea",
+            handler=_add_task,
+            parameters=(
+                ArgumentSpec("text", str, max_length=MAX_REMINDER_TEXT),
+                ArgumentSpec("due", str, pattern=TASK_DUE_PATTERN),
+                ArgumentSpec("kind", str, allowed_values=TASK_KINDS),
+            ),
+            invalid_arguments="Indica qué anotar. Ejemplo «anota la tarea leer el capítulo 3».",
+        ),
+        ToolSpec(
+            id=ToolId.FINISH_TASK,
+            permission=Permission.FINISH_TASK,
+            error_target="marcar la tarea",
+            handler=_finish_task,
+            parameters=(ArgumentSpec("task", str, max_length=MAX_REMINDER_TEXT),),
+            invalid_arguments="Indica qué tarea terminó. Ejemplo «marca como hecha la tarea 2».",
+        ),
+        ToolSpec(
+            id=ToolId.REMOVE_TASK,
+            permission=Permission.REMOVE_TASK,
+            error_target="borrar la tarea",
+            handler=_remove_task,
+            parameters=(ArgumentSpec("task", str, max_length=MAX_REMINDER_TEXT),),
+            invalid_arguments="Indica qué tarea borrar. Ejemplo «borra la tarea 2».",
+        ),
+        ToolSpec(
+            id=ToolId.CONNECT_CALENDAR,
+            permission=Permission.CONNECT_CALENDAR,
+            error_target="abrir la ventana de calendarios",
+            handler=_connect_calendar,
+        ),
+        ToolSpec(
+            id=ToolId.LIST_CALENDARS,
+            permission=Permission.READ_CALENDARS,
+            error_target="leer los calendarios",
+            handler=_list_calendars,
+        ),
+        ToolSpec(
+            id=ToolId.REMOVE_CALENDAR,
+            permission=Permission.REMOVE_CALENDAR,
+            error_target="desconectar el calendario",
+            handler=_remove_calendar,
+            parameters=(ArgumentSpec("name", str, max_length=40),),
+            invalid_arguments="Indica qué calendario desconectar.",
+            approval_preview=lambda args: f"Desconectar el calendario «{args['name']}» y borrar su enlace.",
+        ),
+        ToolSpec(
+            id=ToolId.WEATHER,
+            permission=Permission.READ_WEATHER,
+            error_target="consultar el clima",
+            handler=_weather,
+            parameters=(
+                ArgumentSpec("city", str, pattern=rf"(?:{CITY_PATTERN})?"),
+                ArgumentSpec("day", str, allowed_values=("hoy", "manana")),
+            ),
+            invalid_arguments="Solo puedo dar el clima de hoy o de mañana en una ciudad.",
+        ),
+        ToolSpec(
+            id=ToolId.SET_CITY,
+            permission=Permission.SET_CITY,
+            error_target="recordar la ciudad",
+            handler=_set_city,
+            parameters=(ArgumentSpec("city", str, pattern=CITY_PATTERN),),
+            invalid_arguments="Indica una ciudad. Ejemplo «mi ciudad es Medellín».",
+        ),
+        ToolSpec(
+            id=ToolId.CALCULATE,
+            permission=Permission.CALCULATE,
+            error_target="calcular",
+            handler=_calculate,
+            parameters=(ArgumentSpec("expression", str, pattern=r"[\d+\-*/().,%^ sqrt×÷]{1,120}"),),
+            invalid_arguments="Solo puedo calcular con números y operaciones.",
         ),
     )
 })
