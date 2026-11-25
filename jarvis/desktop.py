@@ -134,6 +134,8 @@ class _Listen:
     cancelled: bool = False
     level: float = 0.0
     on_text: object = None  # si existe, recibe lo oído en lugar de ejecutarlo como orden
+    microphone: object = None  # micrófono ya abierto por el detector (jarvis/wake.py)
+    chimed: bool = False    # sonó el pitido: puede estar al comienzo del audio
     quiet: bool = False     # si no se oye nada, no muestra aviso (escucha de seguimiento)
 
     def set_level(self, level: float) -> None:
@@ -142,7 +144,8 @@ class _Listen:
 
 def _listen_task(voice, listen: _Listen) -> None:
     try:
-        text = voice.listen(listen.stop, on_level=listen.set_level, on_transcribing=listen.transcribing.set)
+        extra = {} if listen.microphone is None else {"microphone": listen.microphone, "chimed": listen.chimed}
+        text = voice.listen(listen.stop, on_level=listen.set_level, on_transcribing=listen.transcribing.set, **extra)
         listen.events.put(("text", text))
     except VoiceUnavailable as error:
         listen.events.put(("error", str(error)))
@@ -707,13 +710,15 @@ class DesktopWindow:
         self.start_listening()
         return "break"
 
-    def listen_from_hotkey(self) -> None:
+    def listen_from_hotkey(self, *, since: float | None = None, chimed: bool = False) -> None:
+        since = monotonic() if since is None else since
         self._greeted = True  # quien llama para hablar no necesita el saludo
         if self.root.state() == "withdrawn":
             self.show_from_tray()
-        self.start_listening()
+        self.start_listening(since=since, chimed=chimed)
 
-    def start_listening(self, *, on_text=None, quiet: bool = False) -> None:
+    def start_listening(self, *, on_text=None, quiet: bool = False, since: float | None = None,
+                        chimed: bool = False) -> None:
         """Empieza a escuchar; si ya escucha, termina la grabación y transcribe lo dicho.
 
         ``on_text`` recibe lo oído en vez de ejecutarlo (respuestas sí/no durante una aprobación);
@@ -729,9 +734,17 @@ class DesktopWindow:
             return
         listen = _Listen(on_text=on_text, quiet=quiet)
         self._listen = listen
-        if self._wake is not None:
-            self._wake.pause()  # el micrófono queda para la orden
+        speaking = getattr(self.voice, "speaking", False)
         self.voice.stop_speaking()
+        if self._wake is not None:
+            lend = getattr(self._wake, "lend", None)
+            # Si JARVIS hablaba, no se conserva su propia voz como parte de la orden.
+            moment = monotonic() if speaking or since is None else since
+            listen.microphone = lend(moment) if lend is not None else None
+            listen.chimed = chimed
+            if listen.microphone is None:
+                self._wake.pause()  # el micrófono queda para la orden
+            self._diag(f"micrófono prestado={listen.microphone is not None}")
         self._warm_voice()
         if on_text is None:
             self.command.set("")
@@ -893,7 +906,7 @@ class DesktopWindow:
             self._diag(f"barra recibió la activación; estado={self.root.state()} ocupado={busy}")
             if not any(busy.values()):
                 _wake_chime()
-                self.listen_from_hotkey()
+                self.listen_from_hotkey(since=self._wake.wake_at, chimed=True)
                 self._diag(f"escucha iniciada={self._listen is not None}; estado={self.root.state()}")
         if self._wake.error and self.hint["text"] != f"«Hey Jarvis» no disponible: {self._wake.error}":
             self.hint.configure(text=f"«Hey Jarvis» no disponible: {self._wake.error}")

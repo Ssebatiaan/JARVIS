@@ -11,6 +11,7 @@ Todo el audio se procesa en memoria y en el propio PC; no se graba ni se envía 
 
 import hashlib
 import os
+import queue
 import threading
 import urllib.request
 from collections import deque
@@ -30,6 +31,8 @@ SENSITIVITY = {"alta": 0.15, "normal": 0.22, "baja": 0.35}
 THRESHOLD = SENSITIVITY["normal"]
 REFRACTORY_SECONDS = 2.0
 WARMUP_PREDICTIONS = 5
+RECENT_SECONDS = 4.0  # audio reciente en memoria: no se pierde lo dicho justo tras «Hey Jarvis»
+LENT_TIMEOUT = 1.5
 MODEL_URL = "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/{}"
 MODELS = {
     "melspectrogram.onnx": "ba2b0e0f8b7b875369a2c89cb13360ff53bac436f2895cced9f479fa65eb176f",
@@ -140,6 +143,30 @@ def microphone_chunks(stop: threading.Event) -> Iterator:
             yield data[:, 0].copy()
 
 
+class LentMicrophone:
+    """El micrófono ya abierto por el detector, prestado para grabar una orden sin huecos."""
+
+    def __init__(self, chunks, noise: float):
+        self._queue: queue.SimpleQueue = queue.SimpleQueue()
+        self.noise = noise  # nivel de fondo medido antes de que el usuario hable
+        for chunk in chunks:
+            self._queue.put(chunk)
+
+    def put(self, chunk) -> None:
+        self._queue.put(chunk)
+
+    def blocks(self, stop: threading.Event) -> Iterator:
+        """Trozos de 80 ms en float32, empezando por los que ya se oyeron."""
+        import numpy as np
+
+        while not stop.is_set():
+            try:
+                chunk = self._queue.get(timeout=LENT_TIMEOUT)
+            except queue.Empty:
+                raise WakeWordUnavailable("El micrófono dejó de enviar audio.") from None
+            yield chunk.astype(np.float32) / 32768
+
+
 class WakeWordListener:
     """Escucha en segundo plano y llama a ``on_wake`` al oír «Hey Jarvis».
 
@@ -163,6 +190,10 @@ class WakeWordListener:
         self.error: str | None = None
         self.personal = False  # True cuando usa el verificador entrenado con la voz del usuario
         self._on_clap = on_clap
+        self._lend_lock = threading.Lock()
+        self._lent: LentMicrophone | None = None
+        self._recent: deque = deque(maxlen=round(RECENT_SECONDS * SAMPLE_RATE / CHUNK))
+        self.wake_at = 0.0  # cuándo se oyó la última activación
         self.claps_enabled = on_clap is not None  # «clap clap» en el mismo audio
 
     @property
@@ -186,7 +217,21 @@ class WakeWordListener:
         self._paused.set()
 
     def resume(self) -> None:
+        with self._lend_lock:
+            self._lent = None
         self._paused.clear()
+
+    def lend(self, since: float) -> LentMicrophone | None:
+        """Presta el micrófono con lo oído desde ``since`` (monotonic). None si no está abierto."""
+        import numpy as np
+
+        with self._lend_lock:
+            if self._paused.is_set() or not self._recent or monotonic() - self._recent[-1][0] > 0.5:
+                return None
+            levels = [float(np.sqrt(np.mean((chunk / 32768.0) ** 2))) for _, chunk in self._recent]
+            self._lent = LentMicrophone([chunk for at, chunk in self._recent if at > since],
+                                        float(np.percentile(levels, 20)))
+            return self._lent
 
     def reload_verifier(self) -> None:
         """Vuelve a leer el verificador personal (tras entrenarlo u olvidarlo)."""
@@ -223,10 +268,22 @@ class WakeWordListener:
             if self._paused.is_set():
                 self._stop.wait(0.1)
                 continue
+            was_lent = False
             try:
                 for chunk in self._chunks(self._stop):
                     if self._paused.is_set():
                         break  # suelta el micrófono mientras JARVIS lo usa
+                    with self._lend_lock:
+                        self._recent.append((monotonic(), chunk))
+                        lent = self._lent
+                        if lent is not None:
+                            lent.put(chunk)
+                    if lent is not None:
+                        was_lent = True
+                        continue  # el micrófono está prestado: no se busca «Hey Jarvis»
+                    if was_lent:
+                        was_lent = False
+                        model.reset()
                     if self._reload.is_set():
                         self._reload.clear()
                         verifier = self._load_verifier()
@@ -234,6 +291,7 @@ class WakeWordListener:
                     if claps is not None and self.claps_enabled:
                         candidate = claps.last_candidate
                         if claps.feed(chunk) and monotonic() - last_wake >= REFRACTORY_SECONDS:
+                            self.wake_at = monotonic()
                             diagnose(self._folder, f"PALMADAS pico={claps.last_candidate.peak:.3f}")
                             last_wake = monotonic()
                             claps.reset()
@@ -248,6 +306,7 @@ class WakeWordListener:
                     if (detected or fake) and monotonic() - last_wake >= REFRACTORY_SECONDS:
                         diagnose(self._folder, f"ACTIVACION{' simulada' if fake else ''} puntaje={value:.3f}")
                         last_wake = monotonic()
+                        self.wake_at = last_wake
                         model.reset()
                         self._on_wake()
             except WakeWordUnavailable as error:
@@ -257,6 +316,8 @@ class WakeWordListener:
             except Exception as error:
                 diagnose(self._folder, f"error inesperado: {type(error).__name__}: {error}")
                 self._stop.wait(2)
+            with self._lend_lock:
+                self._recent.clear()
             model.reset()
 
     def _evaluate(self, model, chunk, verifier) -> tuple[bool, float]:

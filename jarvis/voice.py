@@ -17,10 +17,11 @@ from time import monotonic, sleep
 SAMPLE_RATE = 16_000
 BLOCK_SECONDS = 0.1
 WHISPER_MODEL = "base"
+# Órdenes habituales: Whisper reconoce mejor lo que aparece aquí (no cuesta RAM).
 VOCABULARY = (
-    "Jarvis, abre el Bloc de notas, consulta la CPU y la RAM, sube o baja el volumen, "
-    "lista procesos, abre la carpeta del proyecto, recuerda que, qué recuerdas, olvida, "
-    "abre SAVIO."
+    "Jarvis, abre SAVIO. ¿Puedes abrir Discord? Abre YouTube y reproduce una canción. Pausa la canción. "
+    "Minimiza todas las ventanas. Cambia a Opera GX. Cierra Spotify. Recuérdame mañana. Pon un temporizador. "
+    "Consulta la CPU, la RAM y la GPU. Sube o baja el volumen. Qué recuerdas, olvida. Eso es todo."
 )
 VOICE = "es-MX-JorgeNeural"
 # Velocidad de la voz (el usuario la encontraba muy pausada a -6 %). Se cambia con la voz.
@@ -45,6 +46,8 @@ MAX_RECORD_SECONDS = 15.0
 SILENCE_TO_STOP = 1.0
 NO_SPEECH_TIMEOUT = 6.0
 MIN_THRESHOLD = 0.005
+MAX_THRESHOLD = 0.03
+CHIME_SECONDS = 0.4  # desde la activación hasta que termina el pitido
 SPOKEN_LIMIT = 420
 PACKAGES = {"faster_whisper": "faster-whisper", "sounddevice": "sounddevice", "edge_tts": "edge-tts", "av": "av"}
 # Frases que Whisper inventa sobre silencio o ruido (habituales en español).
@@ -115,43 +118,50 @@ def microphone_blocks(stop: threading.Event) -> Iterator:
             yield data[:, 0].copy()
 
 
+def speech_threshold(noise: float) -> float:
+    """Nivel a partir del cual hay voz, con un tope para no ignorar a quien habla bajo."""
+    return max(MIN_THRESHOLD, min(noise * 3.5, max(MAX_THRESHOLD, noise * 1.8)))
+
+
 def record_until_silence(
     stop: threading.Event,
     *,
     blocks: Iterable | None = None,
     on_level: Callable[[float], None] | None = None,
+    noise: float | None = None,
+    block_seconds: float = BLOCK_SECONDS,
+    deaf_seconds: float = 0.0,
 ):
     """Graba hasta una pausa tras hablar. Devuelve el audio o None si no se detectó voz.
 
-    ``stop`` termina la grabación antes de tiempo (se conserva lo grabado).
+    ``stop`` termina la grabación antes de tiempo (se conserva lo grabado). ``noise`` es el ruido de
+    fondo medido antes de que el usuario hable; ``deaf_seconds``, el comienzo que se graba pero no
+    cuenta como voz porque puede contener el pitido de JARVIS.
     """
     import numpy as np
 
     source = blocks if blocks is not None else microphone_blocks(stop)
     # Se cuentan bloques enteros: sumar 0,1 s repetidamente acumula error de redondeo.
-    silence_blocks = round(SILENCE_TO_STOP / BLOCK_SECONDS)
-    no_speech_blocks = round(NO_SPEECH_TIMEOUT / BLOCK_SECONDS)
-    max_blocks = round(MAX_RECORD_SECONDS / BLOCK_SECONDS)
+    silence_blocks = round(SILENCE_TO_STOP / block_seconds)
+    no_speech_blocks = round(NO_SPEECH_TIMEOUT / block_seconds)
+    max_blocks = round(MAX_RECORD_SECONDS / block_seconds)
+    deaf_blocks = round(deaf_seconds / block_seconds)
     collected, levels = [], []
-    threshold = None
     speech = False
-    silent = 0
     for block in source:
         level = _rms(block)
         if on_level is not None:
             on_level(level)
         collected.append(block)
         levels.append(level)
-        if threshold is None:
-            if len(levels) < 3:
-                continue
-            threshold = max(MIN_THRESHOLD, min(levels) * 3.5)
-        if level > threshold:
-            speech, silent = True, 0
-        elif speech:
-            silent += 1
-            if silent >= silence_blocks:
-                break
+        if len(levels) < 3:
+            continue
+        # Se reevalúa todo lo grabado: si ya hablaba al empezar, la primera pausa revela el ruido real.
+        threshold = speech_threshold(noise if noise is not None else min(levels))
+        voiced = [index for index, value in enumerate(levels) if value > threshold and index >= deaf_blocks]
+        speech = bool(voiced)
+        if speech and len(levels) - 1 - voiced[-1] >= silence_blocks:
+            break
         if not speech and len(collected) >= no_speech_blocks:
             return None
         if len(collected) >= max_blocks or stop.is_set():
@@ -567,12 +577,23 @@ class Voice:
             pass
 
     def listen(self, stop: threading.Event, *, on_level: Callable[[float], None] | None = None,
-               on_transcribing: Callable[[], None] | None = None) -> str | None:
-        """Graba hasta una pausa y devuelve el texto, o None si no se oyó a nadie."""
+               on_transcribing: Callable[[], None] | None = None, microphone=None,
+               chimed: bool = False) -> str | None:
+        """Graba hasta una pausa y devuelve el texto, o None si no se oyó a nadie.
+
+        ``microphone`` es el micrófono ya abierto por el detector de «Hey Jarvis» (sin huecos).
+        """
         self.stop_speaking()
         if not getattr(self.recognizer, "loaded", True):
             self.preload()  # el modelo se carga mientras el usuario habla
-        audio = self._record(stop, on_level=on_level)
+        if microphone is not None:
+            from .wake import CHUNK
+
+            audio = self._record(stop, on_level=on_level, blocks=microphone.blocks(stop),
+                                 noise=microphone.noise, block_seconds=CHUNK / SAMPLE_RATE,
+                                 deaf_seconds=CHIME_SECONDS if chimed else 0.0)
+        else:
+            audio = self._record(stop, on_level=on_level)
         if audio is None:
             return None
         if on_transcribing is not None:

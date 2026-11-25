@@ -74,6 +74,18 @@ class RecordTests(unittest.TestCase):
     def test_returns_none_when_nobody_speaks(self):
         self.assertIsNone(record_until_silence(threading.Event(), blocks=self.blocks("-" * 80)))
 
+    def test_hears_someone_already_talking_when_it_starts(self):
+        # Sin silencio inicial el umbral antiguo (3,5 veces lo más bajo) ignoraba toda la frase.
+        audio = record_until_silence(threading.Event(), blocks=self.blocks("#" * 12 + "-" * 30))
+        self.assertEqual(len(audio), 1600 * (12 + 10))
+
+    def test_the_chime_is_not_taken_for_speech(self):
+        audio = record_until_silence(threading.Event(), blocks=self.blocks("##" + "-" * 15 + "#" * 6 + "-" * 30),
+                                     noise=0.002, deaf_seconds=0.4)
+        self.assertEqual(len(audio), 1600 * (2 + 15 + 6 + 10))
+        self.assertIsNone(record_until_silence(threading.Event(), blocks=self.blocks("##" + "-" * 80),
+                                               noise=0.002, deaf_seconds=0.4))
+
     def test_stop_ends_early_and_keeps_what_was_said(self):
         stop = threading.Event()
 
@@ -458,9 +470,11 @@ class FollowUpTests(unittest.TestCase):
         with unittest.mock.patch("jarvis.desktop._reminder_chime") as chime:
             window.enable_reminders(store)
             window._listen = Mock()  # ocupado: el aviso espera
+            window.root.after_cancel(window._reminders_after)
             window._poll_reminders()
             self.assertEqual(len(store.pending_reminders()), 1)
             window._listen = None
+            window.root.after_cancel(window._reminders_after)
             window._poll_reminders()
             self.wait_until(lambda: self.voice.say.called)
         self.voice.say.assert_called_once_with("Señor, le recuerdo: sacar la ropa.")

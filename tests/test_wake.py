@@ -112,6 +112,38 @@ class ListenerTests(unittest.TestCase):
         listener.resume()
         self.assertTrue(self.heard.wait(3))
 
+    def test_lends_the_open_microphone_without_losing_the_first_words(self):
+        import numpy as np
+
+        model, heard, sent = FakeModel([0.0] * 5 + [0.99] * 3), threading.Event(), []
+
+        def chunks(stop):
+            while not stop.is_set():
+                sleep(0.04)  # como en la realidad (80 ms), por encima de la resolución de monotonic
+                sent.append(len(sent))
+                yield np.full(wake.CHUNK, sent[-1], np.int16)
+
+        listener = WakeWordListener(Path("."), heard.set, model_factory=lambda folder: model, chunks=chunks)
+        with patch.object(wake, "ensure_models", side_effect=lambda folder: folder):
+            self.addCleanup(listener.stop)
+            listener.start()
+            self.assertTrue(heard.wait(3))
+            sleep(0.15)  # lo que tardan el pitido y la ventana
+            lent = listener.lend(listener.wake_at)
+            stop = threading.Event()
+            source = lent.blocks(stop)
+            values = [round(float(next(source)[0]) * 32768) for _ in range(30)]
+            stop.set()
+            self.assertEqual(values, list(range(values[0], values[0] + 30)))  # sin huecos
+            self.assertEqual(values[0], 6)  # justo después de la activación (trozo 5)
+            scored = len(model.scores)
+            listener.resume()
+            sleep(0.1)
+            self.assertIsNone(listener._lent)
+            self.assertLessEqual(len(model.scores), scored)
+            listener.pause()
+            self.assertIsNone(listener.lend(0))
+
     def test_reports_load_errors(self):
         listener = WakeWordListener(Path("."), Mock(), model_factory=Mock(side_effect=OSError("sin modelo")))
         with patch.object(wake, "ensure_models", side_effect=WakeWordUnavailable("sin red")):
@@ -137,6 +169,8 @@ class FakeListener:
         self.claps_enabled = on_clap is not None
         self.calls = []
         self.error = None
+        self.wake_at = 0.0
+        self.lent = None
         FakeListener.instances.append(self)
 
     def start(self):
@@ -150,6 +184,10 @@ class FakeListener:
 
     def resume(self):
         self.calls.append("resume")
+
+    def lend(self, since):
+        self.since = since
+        return self.lent
 
     personal = False
 
@@ -214,7 +252,7 @@ class DesktopWakeTests(unittest.TestCase):
         listener.on_wake()
         self.wait_until(lambda: self.voice.listen.called and self.window._listen is None)
         self.chime.assert_called_once_with()
-        self.assertEqual(listener.calls, ["start", "pause", "resume"])
+        self.assertEqual(listener.calls, ["start", "pause", "resume"])  # sin préstamo: suelta el micrófono
 
     def test_spoken_toggle_turns_it_off_and_is_remembered(self):
         self.window.enable_wake_word(Path("."))
