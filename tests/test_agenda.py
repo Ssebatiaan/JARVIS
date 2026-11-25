@@ -236,6 +236,59 @@ class CalendarsTests(unittest.TestCase):
         items, warnings = self.calendars.events(NOW, self.end)
         self.assertEqual((len(items), len(warnings)), (1, 1))
 
+    def test_imported_files_update_themselves_and_warn_when_old(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        downloads, folder = Path(temporary.name) / "Descargas", Path(temporary.name) / "calendarios"
+        downloads.mkdir()
+        calendars = Calendars(self.vault, folder=folder, download=self.download)
+        first = downloads / "icalexport.ics"
+        first.write_bytes(MOODLE)
+        self.vault["SAVIO"] = "https://viejo.test/"
+        calendars.import_file("SAVIO", first)
+        self.assertEqual((calendars.names(), dict(self.vault)), (["SAVIO"], {}))  # sustituye al enlace
+        self.assertEqual([len(part) for part in calendars.events(NOW, self.end)], [1, 0])
+        future = datetime.now().timestamp() + 60
+        (downloads / "icalexport (1).ics").write_bytes(MOODLE.replace(b"Taller 2", b"Taller 9"))
+        (downloads / "otro.ics").write_bytes(MOODLE.replace(b"Taller 2", b"Ajeno"))
+        (downloads / "icalexport (2).ics").write_bytes(b"<html>")
+        os.utime(downloads / "icalexport (1).ics", (future, future))
+        os.utime(downloads / "otro.ics", (future + 90, future + 90))
+        self.assertIn("Taller 9", calendars.events(NOW, self.end)[0][0].title)
+        os.utime(downloads / "icalexport (2).ics", (future + 120, future + 120))
+        self.assertIn("Taller 9", calendars.events(NOW, self.end)[0][0].title)  # uno dañado no lo sustituye
+        for path in downloads.iterdir():
+            path.unlink()
+        old = datetime.now() - timedelta(days=5)
+        details = folder / "SAVIO.json"
+        details.write_text(details.read_text(encoding="utf-8").replace(str(future), str(old.timestamp())), encoding="utf-8")
+        items, warnings = calendars.events(NOW, self.end)
+        self.assertEqual(len(items), 1)
+        self.assertIn(f"es del {old:%d/%m}", warnings[0])
+        self.assertTrue(calendars.remove("SAVIO"))
+        self.assertEqual((calendars.names(), list(folder.iterdir())), ([], []))
+
+    def test_rejects_files_that_are_not_calendars(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        folder = Path(temporary.name)
+        calendars = Calendars(self.vault, folder=folder / "c", download=self.download)
+        for name, content in (("a.txt", MOODLE), ("b.ics", b"<html>")):
+            (folder / name).write_bytes(content)
+            with self.subTest(name=name), self.assertRaises(CalendarError):
+                calendars.import_file("SAVIO", folder / name)
+        for bad in ("../x", "a/b", ""):
+            with self.subTest(bad=bad), self.assertRaises(CalendarError):
+                calendars.import_file(bad, folder / "b.ics")
+        self.assertEqual(calendars.names(), [])
+
+    def test_bot_protection_is_explained(self):
+        error = urllib.error.HTTPError("https://x.test/", 403, "no", {"cf-mitigated": "challenge"}, None)
+        with patch.object(calendars_module.urllib.request, "build_opener") as opener:
+            opener.return_value.open.side_effect = error
+            with self.assertRaisesRegex(CalendarError, "Importar archivo"):
+                fetch("https://x.test/")
+
     def test_network_errors_never_reveal_the_link(self):
         error = urllib.error.HTTPError("https://x.test/?token=SECRETO", 403, "no", {}, None)
         with patch.object(calendars_module.urllib.request, "build_opener") as opener:

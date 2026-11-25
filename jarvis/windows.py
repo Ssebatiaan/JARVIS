@@ -253,7 +253,8 @@ class WindowsTools:
             from .calendars import Calendars
             from .vault import CredentialVault
 
-            self._calendars = Calendars(CredentialVault(CALENDAR_VAULT))
+            folder = self._memory.path.parent / "calendarios" if self._memory is not None else None
+            self._calendars = Calendars(CredentialVault(CALENDAR_VAULT), folder=folder)
         return self._calendars
 
     def agenda(self, start, end, now) -> AgendaData:

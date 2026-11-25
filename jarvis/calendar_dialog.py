@@ -1,9 +1,10 @@
 """Ventana para conectar un calendario: el enlace se escribe aquí y no pasa por la IA ni el historial."""
 
 import tkinter as tk
+from pathlib import Path
 from queue import Empty, SimpleQueue
 from threading import Thread
-from tkinter import ttk
+from tkinter import filedialog, ttk
 
 from .tools import CalendarError
 
@@ -11,7 +12,8 @@ BACKGROUND, SURFACE, TEXT, MUTED, CYAN, GREEN, RED = (
     "#0a1016", "#0f1a23", "#e8f5fc", "#6c8696", "#4fd8ff", "#5ee6a0", "#ff6b6b")
 NAMES = ("SAVIO", "Outlook", "Google")
 HELP = (
-    "SAVIO: Calendario → Importar o exportar calendarios → Exportar → Obtener URL.\n"
+    "SAVIO: no admite enlaces. Calendario → Importar o exportar calendarios → Exportar → botón Exportar, y luego\n"
+    "«Importar archivo» aquí. Cuando vuelva a descargarlo en la misma carpeta, JARVIS lo actualiza solo.\n"
     "Outlook web: Configuración → Calendario → Calendarios compartidos → Publicar → enlace ICS.\n"
     "Google: Configuración del calendario → Dirección secreta en formato iCal."
 )
@@ -50,8 +52,12 @@ class CalendarDialog:
         self.status = tk.Label(window, text="", background=BACKGROUND, foreground=MUTED, font=("Segoe UI", 10),
                                justify="left", anchor="w", wraplength=520)
         self.status.pack(fill="x", pady=(6, 4))
-        self.button = ttk.Button(window, text="Conectar", command=self.save)
-        self.button.pack(anchor="e")
+        row = tk.Frame(window, background=BACKGROUND)
+        row.pack(anchor="e")
+        self.file_button = ttk.Button(row, text="Importar archivo .ics…", command=self.choose_file)
+        self.file_button.pack(side="left", padx=(0, 8))
+        self.button = ttk.Button(row, text="Conectar enlace", command=self.save)
+        self.button.pack(side="left")
         self.show()
 
     @property
@@ -70,15 +76,28 @@ class CalendarDialog:
         if not link.strip():
             self.status.configure(text="Pegue el enlace del calendario.", foreground=RED)
             return
+        self._work(self._calendars.add, name, link)
+
+    def choose_file(self) -> None:
+        if self._busy or self.window is None:
+            return
+        path = filedialog.askopenfilename(parent=self.window, title="Calendario descargado",
+                                          initialdir=str(Path.home() / "Downloads"),
+                                          filetypes=[("Calendario", "*.ics")])
+        if path and self.window is not None:
+            self._work(self._calendars.import_file, self.name.get(), Path(path))
+
+    def _work(self, action, *arguments) -> None:
         self._busy = True
-        self.button.configure(state="disabled")
+        for button in (self.button, self.file_button):
+            button.configure(state="disabled")
         self.status.configure(text="Comprobando el calendario…", foreground=MUTED)
-        Thread(target=self._check, args=(name, link), name="jarvis-calendario", daemon=True).start()
+        Thread(target=self._check, args=(action, *arguments), name="jarvis-calendario", daemon=True).start()
         self._after = self.window.after(80, self._poll)
 
-    def _check(self, name: str, link: str) -> None:
+    def _check(self, action, *arguments) -> None:
         try:
-            count = self._calendars.add(name, link)
+            count = action(*arguments)
             what = "1 actividad" if count == 1 else f"{count} actividades"
             self._results.put((True, f"Conectado: {what} en los próximos 60 días."))
         except CalendarError as error:
@@ -96,7 +115,8 @@ class CalendarDialog:
             self._after = self.window.after(80, self._poll)
             return
         self._busy = False
-        self.button.configure(state="normal")
+        for button in (self.button, self.file_button):
+            button.configure(state="normal")
         self.status.configure(text=message, foreground=GREEN if good else RED)
         if good:
             self.link.delete(0, "end")
